@@ -1,4 +1,4 @@
-package dev.codex.chaoxingdeadline;
+package dev.chaoxingdeadline;
 
 import java.text.SimpleDateFormat;
 import java.util.Date;

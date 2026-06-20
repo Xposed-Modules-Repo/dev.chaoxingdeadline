@@ -1,4 +1,4 @@
-package dev.codex.chaoxingdeadline;
+package dev.chaoxingdeadline;
 
 import android.content.Intent;
 import android.graphics.Color;
@@ -11,7 +11,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 public final class AboutActivity extends BaseActivity {
-    private static final String GITHUB_URL = "https://github.com/Xposed-Modules-Repo/dev.codex.chaoxingdeadline";
+    private static final String GITHUB_URL = "https://github.com/Xposed-Modules-Repo/dev.chaoxingdeadline";
     private static final String LICENSE_URL = GITHUB_URL + "/blob/master/LICENSE";
     private static final String NOTICE_URL = GITHUB_URL + "/blob/master/NOTICE";
 
@@ -51,7 +51,7 @@ public final class AboutActivity extends BaseActivity {
         appName.setPadding(0, 0, 0, dp(4));
         content.addView(appName, new LinearLayout.LayoutParams(-1, -2));
 
-        TextView version = text("版本 1.0", 14, false, UiTheme.muted(this));
+        TextView version = text("版本 1.1", 14, false, UiTheme.muted(this));
         version.setGravity(Gravity.CENTER);
         version.setPadding(0, 0, 0, dp(28));
         content.addView(version, new LinearLayout.LayoutParams(-1, -2));

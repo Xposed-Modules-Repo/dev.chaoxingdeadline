@@ -1,4 +1,4 @@
-package dev.codex.chaoxingdeadline;
+package dev.chaoxingdeadline;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -19,8 +19,7 @@ public final class DeadlineParser {
             "deadline", "deadLine", "dueTime", "duetime", "endTime", "endtime", "end_time",
             "endDate", "enddate", "closeTime", "finishTime", "expireTime", "stopTime",
             "submitEndTime", "submitendtime", "workEndTime", "examEndTime", "lastSubmitTime",
-            "endtimeStr", "endTimeStr", "taskEndTime", "limitTime", "limittime",
-            "nameFour", "namefive", "nameFive"
+            "endtimeStr", "endTimeStr", "taskEndTime", "limitTime", "limittime"
     };
     private static final String[] TITLE_KEYS = {
             "title", "name", "workName", "examName", "courseName", "chapterName",
@@ -65,52 +64,68 @@ public final class DeadlineParser {
     }
 
     public static List<DeadlineItem> parsePayload(String text, String source) {
+        return parsePayload(text, ParseContext.fromSource(source, ""));
+    }
+
+    public static List<DeadlineItem> parsePayload(String text, ParseContext context) {
+        ParseContext ctx = context == null ? ParseContext.simple("") : context;
         ArrayList<DeadlineItem> result = new ArrayList<>();
-        if (text != null && source != null && source.startsWith("active.")) {
-            result.addAll(parseHtmlList(text, source));
+        if (text != null && ctx.isActive()) {
+            result.addAll(parseHtmlList(text, ctx));
         }
-        if (!looksRelevant(text)) {
+        if (!looksRelevant(text) && !sourceLooksLikeDeadline(ctx)) {
             return result;
         }
         try {
             String trimmed = text.trim();
             Object root = trimmed.startsWith("[") ? new JSONArray(trimmed) : new JSONObject(trimmed);
-            collect(root, "", source, "", result, 0);
+            collect(root, "", ctx, "", result, 0);
         } catch (Throwable ignored) {
         }
         return result;
     }
 
-    private static List<DeadlineItem> parseHtmlList(String html, String source) {
+    private static boolean sourceLooksLikeDeadline(ParseContext context) {
+        if (context == null) {
+            return false;
+        }
+        String scope = ((context.source == null ? "" : context.source) + " "
+                + (context.url == null ? "" : context.url)).toLowerCase(Locale.ROOT);
+        return scope.contains("work") || scope.contains("homework") || scope.contains("exam")
+                || scope.contains("task-list") || scope.contains("taskactivelist")
+                || scope.contains("stu-work") || scope.contains("examcode")
+                || scope.contains("作业") || scope.contains("考试") || scope.contains("任务");
+    }
+
+    private static List<DeadlineItem> parseHtmlList(String html, ParseContext context) {
         ArrayList<DeadlineItem> result = new ArrayList<>();
+        String source = context == null ? "" : context.source;
         if (html == null || html.length() < 20 || html.indexOf('<') < 0) {
             return result;
         }
         if (source.contains("workPage") || source.contains("workList") || html.contains("stu-work")) {
-            parseListItems(html, source, "作业", result);
+            parseListItems(html, context, "作业", result);
         }
         if (source.contains("examPage") || source.contains("examList")
                 || html.contains("ks_list") || html.contains("examcode")) {
-            parseListItems(html, source, "考试", result);
+            parseListItems(html, context, "考试", result);
         }
         if (source.contains("chapterList") || html.contains("knowledge") || html.contains("chapter")) {
-            parseListItems(html, source, "章节", result);
+            parseListItems(html, context, "章节", result);
         }
         return result;
     }
 
-    private static void parseListItems(String html, String source, String type, List<DeadlineItem> out) {
+    private static void parseListItems(String html, ParseContext context, String type, List<DeadlineItem> out) {
         Matcher matcher = Pattern.compile("(?is)<li\\b([^>]*)>(.*?)</li>").matcher(html);
         while (matcher.find()) {
             String attrs = matcher.group(1);
             String li = matcher.group(2);
             String plain = stripTags(li);
-            if (plain.contains("已完成") || plain.contains("待批阅") || plain.contains("已提交")
-                    || (plain.contains("已交") && !plain.contains("未交"))
-                    || plain.contains("已结束") || plain.contains("已过期")) {
+            if (isHtmlSubmitted(plain)) {
                 continue;
             }
-            long dueAt = parseDueFromText(plain);
+            long dueAt = parseDueFromText(plain, context);
             if (dueAt <= System.currentTimeMillis()) {
                 continue;
             }
@@ -128,22 +143,47 @@ public final class DeadlineParser {
                 title = firstNonEmptyLine(plain);
             }
             String course = secondSpanText(li);
+            int confidence = 30;
             if (badCourseText(course)) {
-                course = courseNameFromSource(source);
+                course = context == null ? "" : context.courseName;
+                confidence = context == null ? 0 : context.courseConfidence;
             }
             DeadlineItem item = new DeadlineItem();
             item.type = type;
             item.title = clean(stripTags(title));
             item.course = clean(stripTags(course));
+            item.courseConfidence = confidence;
             item.dueAt = dueAt;
             item.submitted = false;
-            item.source = source;
+            item.source = context == null ? "" : context.source;
+            item.url = context == null ? "" : context.url;
             item.raw = matcher.group(0);
+            fillIdentityFromRaw(item, attrs + " " + li);
+            if (context != null) {
+                item.applyContext(context);
+            }
             item.id = htmlStableId(type, attrs + " " + li, item.title, item.course);
+            if (!item.taskId.isEmpty() || !item.courseId.isEmpty()) {
+                item.id = item.stableId();
+            }
             if (!item.title.isEmpty()) {
                 out.add(item);
             }
         }
+    }
+
+    private static boolean isHtmlSubmitted(String plain) {
+        if (plain == null) {
+            return false;
+        }
+        boolean explicitlyUnfinished = plain.contains("未完成") || plain.contains("未提交")
+                || plain.contains("未交") || plain.contains("待完成") || plain.contains("待提交");
+        if (explicitlyUnfinished) {
+            return false;
+        }
+        return plain.contains("待批阅") || plain.contains("已提交")
+                || plain.contains("已完成") || plain.contains("已结束") || plain.contains("已过期")
+                || (plain.contains("已交") && !plain.contains("未交"));
     }
 
     private static boolean badCourseText(String course) {
@@ -173,27 +213,79 @@ public final class DeadlineParser {
             if (matcher.find()) {
                 return matcher.group(1);
             }
+            matcher = Pattern.compile("(?i)" + Pattern.quote(key) + "[\\\"']?\\s*[:=]\\s*[\\\"']?([^,}&\\\"'\\s>]+)").matcher(text);
+            if (matcher.find()) {
+                return matcher.group(1);
+            }
         }
         return "";
     }
 
-    private static long parseDueFromText(String text) {
+    private static void fillIdentityFromRaw(DeadlineItem item, String raw) {
+        if (item == null || raw == null) {
+            return;
+        }
+        item.taskId = firstParam(raw, "taskrefId", "taskId", "workId", "workid", "examId", "examid", "id", "aid", "paperId");
+        item.courseId = firstParam(raw, "courseId", "courseid", "courseIdStr", "courseidStr", "moocId");
+        item.classId = firstParam(raw, "classId", "classid", "clazzId", "clazzid", "clazzIdStr", "classIdStr");
+        item.cpi = firstParam(raw, "cpi", "cpiId");
+        item.uid = firstParam(raw, "uid", "puid", "personid", "personId");
+    }
+
+    private static long parseDueFromText(String text, ParseContext context) {
         long absolute = parseTimeFromFreeText(text);
         if (absolute > 0) {
             return absolute;
         }
+        if (!allowRelativeDueFallback(context)) {
+            return 0L;
+        }
+        return parseRelativeDueFromText(text);
+    }
+
+    private static boolean allowRelativeDueFallback(ParseContext context) {
+        String source = context == null || context.source == null ? "" : context.source;
+        // The broad work/exam landing pages usually only show "remaining X days Y hours".
+        // Turning that into an exact timestamp is what produced fake minutes like :04.
+        // Keep relative parsing only for course-scoped detail/list responses as a last resort.
+        if (source.contains("workPage") || source.contains("examPage")) {
+            return false;
+        }
+        return source.contains("workList") || source.contains("examList")
+                || source.contains("taskList") || source.contains("chapter");
+    }
+
+    private static long parseRelativeDueFromText(String text) {
         long now = System.currentTimeMillis();
+        long days = 0L;
         Matcher dayMatcher = Pattern.compile("(?:(?:还剩|剩余|距截止|离截止)\\s*)?(\\d+)\\s*天").matcher(text);
         if (dayMatcher.find()) {
-            long days = Long.parseLong(dayMatcher.group(1));
-            long hours = firstLong(text, "(\\d+)\\s*小时");
-            return now + TimeUnit.DAYS.toMillis(days) + TimeUnit.HOURS.toMillis(hours);
+            days = Long.parseLong(dayMatcher.group(1));
         }
-        long hours = firstLong(text, "(?:还剩|剩余|距截止|离截止)?\\s*(\\d+)\\s*小时");
-        if (hours > 0) {
-            return now + TimeUnit.HOURS.toMillis(hours);
+        long hours = firstLong(text, "(\\d+)\\s*小时");
+        long minutes = firstLong(text, "(\\d+)\\s*分钟");
+        if (days <= 0 && hours <= 0 && minutes <= 0) {
+            return 0L;
         }
-        return 0L;
+        if (minutes > 0) {
+            // Chaoxing list pages show remaining time rounded down, for example
+            // "剩余54小时47分钟" while the real deadline is 54h47m46s away.
+            // Using now + displayed duration directly produced systematic :59 / one-minute-early
+            // deadlines such as 06-22 23:59 for a real 06-23 00:00 deadline.
+            long lowerBound = now + TimeUnit.DAYS.toMillis(days)
+                    + TimeUnit.HOURS.toMillis(hours)
+                    + TimeUnit.MINUTES.toMillis(minutes);
+            return ceilToMinute(lowerBound);
+        }
+        long hourEndBase = now - (now % TimeUnit.HOURS.toMillis(1))
+                + TimeUnit.MINUTES.toMillis(59)
+                + TimeUnit.SECONDS.toMillis(59);
+        return ceilToMinute(hourEndBase + TimeUnit.DAYS.toMillis(days) + TimeUnit.HOURS.toMillis(hours));
+    }
+
+    private static long ceilToMinute(long millis) {
+        long minute = TimeUnit.MINUTES.toMillis(1);
+        return ((millis + minute - 1L) / minute) * minute;
     }
 
     private static long parseTimeFromFreeText(String text) {
@@ -262,18 +354,19 @@ public final class DeadlineParser {
                 .replace("&gt;", ">");
     }
 
-    private static void collect(Object node, String path, String source, String parentCourse, List<DeadlineItem> out, int depth) throws JSONException {
+    private static void collect(Object node, String path, ParseContext context, String parentCourse, List<DeadlineItem> out, int depth) throws JSONException {
         if (node == null || depth > 14) {
             return;
         }
         if (node instanceof JSONObject) {
             JSONObject object = (JSONObject) node;
-            DeadlineItem item = readItem(object, path, source);
+            DeadlineItem item = readItem(object, path, context);
             String currentCourse = firstString(object, PARENT_COURSE_KEYS);
             if (currentCourse.isEmpty()) currentCourse = parentCourse;
             if (item != null) {
                 if ((item.course == null || item.course.isEmpty()) && currentCourse != null && !currentCourse.isEmpty()) {
                     item.course = currentCourse;
+                    item.courseConfidence = Math.max(item.courseConfidence, 50);
                 }
                 out.add(item);
             }
@@ -282,7 +375,7 @@ public final class DeadlineParser {
                 String key = keys.next();
                 Object child = object.opt(key);
                 if (child instanceof JSONObject || child instanceof JSONArray) {
-                    collect(child, path + "/" + key, source, currentCourse, out, depth + 1);
+                    collect(child, path + "/" + key, context, currentCourse, out, depth + 1);
                 }
             }
         } else if (node instanceof JSONArray) {
@@ -290,13 +383,14 @@ public final class DeadlineParser {
             for (int i = 0; i < array.length(); i++) {
                 Object child = array.opt(i);
                 if (child instanceof JSONObject || child instanceof JSONArray) {
-                    collect(child, path + "[" + i + "]", source, parentCourse, out, depth + 1);
+                    collect(child, path + "[" + i + "]", context, parentCourse, out, depth + 1);
                 }
             }
         }
     }
 
-    private static DeadlineItem readItem(JSONObject object, String path, String source) {
+    private static DeadlineItem readItem(JSONObject object, String path, ParseContext context) {
+        String source = context == null ? "" : context.source;
         long dueAt = firstTime(object);
         if (dueAt <= 0) {
             return null;
@@ -316,8 +410,10 @@ public final class DeadlineParser {
         }
         String title = firstString(object, TITLE_KEYS);
         String course = firstString(object, COURSE_KEYS);
+        int confidence = course == null || course.isEmpty() ? 0 : 100;
         if ((course == null || course.isEmpty()) && activeChapter) {
             course = courseNameFromSource(source);
+            confidence = course == null || course.isEmpty() ? 0 : 80;
         }
         if (title == null || title.isEmpty()) {
             title = course == null || course.isEmpty() ? type + "事项" : course;
@@ -326,12 +422,21 @@ public final class DeadlineParser {
         item.type = type;
         item.title = clean(title);
         item.course = clean(course);
+        item.courseConfidence = confidence;
         item.dueAt = dueAt;
         item.submitted = false;
         item.source = source;
+        item.url = context == null ? "" : context.url;
         item.raw = object.toString();
-        String id = firstString(object, ID_KEYS);
-        item.id = id == null || id.isEmpty() ? item.stableId() : type + "_" + id + "_" + dueAt;
+        item.taskId = firstString(object, ID_KEYS);
+        item.courseId = firstString(object, "courseId", "courseid", "courseIdStr", "courseidStr", "moocId");
+        item.classId = firstString(object, "classId", "classid", "clazzId", "clazzid", "clazzIdStr", "classIdStr");
+        item.cpi = firstString(object, "cpi", "cpiId");
+        item.uid = firstString(object, "uid", "puid", "personid", "personId");
+        if (context != null) {
+            item.applyContext(context);
+        }
+        item.id = item.stableId();
         return item;
     }
 
@@ -428,9 +533,13 @@ public final class DeadlineParser {
             }
             return plausible(number) ? number : 0L;
         }
+        boolean dateOnly = isDateOnly(text);
         for (String pattern : DATE_PATTERNS) {
             try {
                 long parsed = new SimpleDateFormat(pattern, Locale.CHINA).parse(text).getTime();
+                if (dateOnly) {
+                    parsed += TimeUnit.DAYS.toMillis(1) - 1000L;
+                }
                 if (plausible(parsed)) {
                     return parsed;
                 }
@@ -438,6 +547,10 @@ public final class DeadlineParser {
             }
         }
         return 0L;
+    }
+
+    private static boolean isDateOnly(String text) {
+        return text != null && text.matches("20\\d{2}(?:[-/.]\\d{1,2}[-/.]\\d{1,2}|年\\d{1,2}月\\d{1,2}日?)");
     }
 
     private static boolean plausible(long millis) {
@@ -469,11 +582,17 @@ public final class DeadlineParser {
                 return true;
             }
         }
-        String all = object.toString();
-        return all.contains("已提交") || all.contains("已完成");
+        return false;
     }
 
     private static String inferType(JSONObject object, String path, String source) {
+        String lowerSource = source == null ? "" : source.toLowerCase(Locale.ROOT);
+        if (lowerSource.contains("exam")) {
+            return "考试";
+        }
+        if (lowerSource.contains("work") || lowerSource.contains("homework") || lowerSource.contains("tasklist")) {
+            return "作业";
+        }
         if (isActiveChapterSource(source)) {
             return "\u7ae0\u8282";
         }
@@ -493,7 +612,7 @@ public final class DeadlineParser {
         return "事项";
     }
 
-    private static String firstString(JSONObject object, String[] keys) {
+    private static String firstString(JSONObject object, String... keys) {
         for (String key : keys) {
             String value = object.optString(key, "");
             if (!value.isEmpty() && !"null".equalsIgnoreCase(value)) {

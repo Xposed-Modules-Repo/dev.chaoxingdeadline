@@ -1,4 +1,4 @@
-package dev.codex.chaoxingdeadline;
+package dev.chaoxingdeadline;
 
 import android.Manifest;
 import android.content.BroadcastReceiver;
@@ -208,6 +208,10 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
     private void reload(boolean firstLoad) {
         items.clear();
         items.addAll(store.activeItems());
+        if (firstLoad) {
+            DeadlineNotifier.rescheduleAll(this, new ArrayList<>(items));
+            OverlayBridge.publish(this);
+        }
         rebuildItemList();
 
         Activation activation = readActivation();
@@ -361,6 +365,8 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         if (service != null) {
             try {
                 sendRefreshCommand(service);
+                DeadlineNotifier.rescheduleAll(this);
+                OverlayBridge.publish(this);
                 getSharedPreferences("status", MODE_PRIVATE).edit()
                         .putString("last_status", "已请求主动刷新").putString("last_source", "本软件").apply();
             } catch (Throwable t) {

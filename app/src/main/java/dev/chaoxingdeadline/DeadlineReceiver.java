@@ -1,4 +1,4 @@
-package dev.codex.chaoxingdeadline;
+package dev.chaoxingdeadline;
 
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -9,11 +9,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
 public final class DeadlineReceiver extends BroadcastReceiver {
-    public static final String ACTION_ITEM = "dev.codex.chaoxingdeadline.DEADLINE_ITEM";
-    public static final String ACTION_STATUS = "dev.codex.chaoxingdeadline.STATUS";
-    public static final String ACTION_REFRESH = "dev.codex.chaoxingdeadline.REFRESH";
-    public static final String ACTION_CHECK = "dev.codex.chaoxingdeadline.CHECK";
-    public static final String ACTION_COURSE = "dev.codex.chaoxingdeadline.COURSE";
+    public static final String ACTION_ITEM = "dev.chaoxingdeadline.DEADLINE_ITEM";
+    public static final String ACTION_STATUS = "dev.chaoxingdeadline.STATUS";
+    public static final String ACTION_REFRESH = "dev.chaoxingdeadline.REFRESH";
+    public static final String ACTION_CHECK = "dev.chaoxingdeadline.CHECK";
+    public static final String ACTION_NOTIFY = "dev.chaoxingdeadline.NOTIFY";
+    public static final String ACTION_COURSE = "dev.chaoxingdeadline.COURSE";
     public static final String EXTRA_ITEM_B64 = "item_b64";
     public static final String EXTRA_STATUS = "status";
     public static final String EXTRA_SOURCE = "source";
@@ -22,6 +23,10 @@ public final class DeadlineReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
         if (intent == null) {
+            return;
+        }
+        if (Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())) {
+            DeadlineNotifier.rescheduleAll(context);
             return;
         }
         if (!BridgeAuth.isValid(context, intent)) {
@@ -40,10 +45,23 @@ public final class DeadlineReceiver extends BroadcastReceiver {
         }
         if (ACTION_CHECK.equals(intent.getAction())) {
             DeadlineNotifier.checkAll(context);
+            OverlayBridge.publish(context);
+            return;
+        }
+        if (ACTION_NOTIFY.equals(intent.getAction())) {
+            DeadlineNotifier.notifyDue(context, intent.getStringExtra("deadline_id"));
+            OverlayBridge.publish(context);
             return;
         }
         if (ACTION_COURSE.equals(intent.getAction())) {
-            new DeadlineStore(context).rememberCourse(intent.getStringExtra("course"));
+            new DeadlineStore(context).rememberCourse(
+                    intent.getStringExtra("course_id"),
+                    intent.getStringExtra("class_id"),
+                    intent.getStringExtra("cpi"),
+                    intent.getStringExtra("uid"),
+                    intent.getStringExtra("course"),
+                    intent.getStringExtra("raw"));
+            OverlayBridge.publish(context);
             context.sendBroadcast(new Intent(ACTION_REFRESH).setPackage(context.getPackageName()));
             return;
         }
@@ -59,22 +77,19 @@ public final class DeadlineReceiver extends BroadcastReceiver {
             Log.i(TAG, "Received deadline payload: " + payload);
             DeadlineItem item = DeadlineItem.fromJson(payload);
             DeadlineStore store = new DeadlineStore(context);
-            if (item.course == null || item.course.trim().isEmpty()) {
-                String inferred = store.inferCourse((item.title == null ? "" : item.title) + "\n" + (item.raw == null ? "" : item.raw));
-                if (!inferred.isEmpty()) {
-                    item.course = inferred;
-                }
-            }
+            store.resolveCourse(item);
             store.upsert(item);
-            store.rememberCourse(item.course);
+            if (item.course != null && !item.course.trim().isEmpty()) {
+                store.rememberCourse(item.courseId, item.classId, item.cpi, item.uid, item.course, item.raw);
+            }
             context.getSharedPreferences("status", Context.MODE_PRIVATE)
                     .edit()
                     .putLong("last_capture_at", System.currentTimeMillis())
                     .putString("last_capture_source", item.source)
                     .apply();
             Log.i(TAG, "Stored deadline: " + item.title + " @ " + item.dueAt);
-            DeadlineNotifier.maybeNotify(context, item);
-            DeadlineNotifier.scheduleNextCheck(context);
+            DeadlineNotifier.rescheduleAll(context);
+            OverlayBridge.publish(context);
             context.sendBroadcast(new Intent(ACTION_REFRESH).setPackage(context.getPackageName()));
         } catch (Throwable throwable) {
             Log.e(TAG, "Failed to receive deadline", throwable);

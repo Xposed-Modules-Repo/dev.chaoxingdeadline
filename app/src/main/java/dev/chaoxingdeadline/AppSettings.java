@@ -1,4 +1,4 @@
-package dev.codex.chaoxingdeadline;
+package dev.chaoxingdeadline;
 
 import android.content.ComponentName;
 import android.content.Context;
@@ -7,7 +7,7 @@ import android.content.pm.PackageManager;
 
 public final class AppSettings {
     public static final String PREFS = "app_settings";
-    public static final String LAUNCHER_ALIAS = "dev.codex.chaoxingdeadline.LauncherActivity";
+    public static final String LAUNCHER_ALIAS = "dev.chaoxingdeadline.LauncherActivity";
 
     private AppSettings() {
     }

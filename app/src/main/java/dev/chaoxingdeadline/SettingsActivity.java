@@ -1,4 +1,4 @@
-package dev.codex.chaoxingdeadline;
+package dev.chaoxingdeadline;
 
 import android.content.Intent;
 import android.os.Bundle;
@@ -55,13 +55,13 @@ public final class SettingsActivity extends BaseActivity {
         content.addView(sectionHeader("通知"));
         LinearLayout group2 = card();
         group2.addView(switchRow("通知提醒", "到达设定时间后发送系统通知", AppSettings.notificationsEnabled(this),
-                (b, c) -> { AppSettings.prefs(this).edit().putBoolean("notify_enabled", c).apply(); DeadlineNotifier.scheduleNextCheck(this); }));
+                (b, c) -> { AppSettings.prefs(this).edit().putBoolean("notify_enabled", c).apply(); DeadlineNotifier.rescheduleAll(this); }));
         group2.addView(divider());
         group2.addView(switchRow("作业提醒", "仅提醒未提交的作业", AppSettings.notifyHomework(this),
-                (b, c) -> { AppSettings.prefs(this).edit().putBoolean("notify_homework", c).apply(); DeadlineNotifier.scheduleNextCheck(this); }));
+                (b, c) -> { AppSettings.prefs(this).edit().putBoolean("notify_homework", c).apply(); DeadlineNotifier.rescheduleAll(this); }));
         group2.addView(divider());
         group2.addView(switchRow("考试提醒", "仅提醒未完成的考试", AppSettings.notifyExam(this),
-                (b, c) -> { AppSettings.prefs(this).edit().putBoolean("notify_exam", c).apply(); DeadlineNotifier.scheduleNextCheck(this); }));
+                (b, c) -> { AppSettings.prefs(this).edit().putBoolean("notify_exam", c).apply(); DeadlineNotifier.rescheduleAll(this); }));
         group2.addView(divider());
         group2.addView(hourRow());
         content.addView(group2, groupParams());
@@ -144,6 +144,7 @@ public final class SettingsActivity extends BaseActivity {
         notifyHours.setText(String.valueOf(hours));
         AppSettings.prefs(this).edit().putInt("notify_hours", hours).apply();
         DeadlineNotifier.checkAll(this);
+        OverlayBridge.publish(this);
         Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show();
     }
 
