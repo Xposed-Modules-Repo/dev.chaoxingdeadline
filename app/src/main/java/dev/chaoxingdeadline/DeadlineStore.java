@@ -15,10 +15,13 @@ import java.util.Set;
 
 public final class DeadlineStore extends SQLiteOpenHelper {
     private static final String DB_NAME = "deadlines.db";
-    private static final int DB_VERSION = 4;
+    private static final int DB_VERSION = 5;
     private static final String PREFS = "blocked_courses";
     private static final String KEY_LEGACY_COURSES = "courses";
     private static final String KEY_BLOCKED_RULES = "rules";
+    private static final String TYPE_ALL = "\u5168\u90e8";
+    private static final String TYPE_HOMEWORK = "\u4f5c\u4e1a";
+    private static final String TYPE_EXAM = "\u8003\u8bd5";
     private final Context context;
 
     public DeadlineStore(Context context) {
@@ -50,6 +53,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         db.execSQL("CREATE INDEX idx_deadlines_course_ref ON deadlines(course_id, class_id)");
         db.execSQL("CREATE INDEX idx_deadlines_task_ref ON deadlines(type, course_id, class_id, task_id)");
         createCourseTable(db);
+        createIgnoredTable(db);
     }
 
     @Override
@@ -75,6 +79,9 @@ public final class DeadlineStore extends SQLiteOpenHelper {
                 db.execSQL("UPDATE deadlines SET submit_state = 1 WHERE submitted != 0");
             } catch (Throwable ignored) {
             }
+        }
+        if (oldVersion < 5) {
+            createIgnoredTable(db);
         }
     }
 
@@ -102,6 +109,20 @@ public final class DeadlineStore extends SQLiteOpenHelper {
                 + "updated_at INTEGER NOT NULL,"
                 + "PRIMARY KEY(course_id, class_id))");
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_courses_name ON courses(name)");
+    }
+
+    private void createIgnoredTable(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS ignored_deadlines ("
+                + "id TEXT PRIMARY KEY,"
+                + "type TEXT NOT NULL,"
+                + "title TEXT NOT NULL,"
+                + "course_id TEXT NOT NULL DEFAULT '',"
+                + "class_id TEXT NOT NULL DEFAULT '',"
+                + "task_id TEXT NOT NULL DEFAULT '',"
+                + "due_at INTEGER NOT NULL,"
+                + "ignored_at INTEGER NOT NULL)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_ignored_due ON ignored_deadlines(due_at)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_ignored_task ON ignored_deadlines(type, course_id, class_id, task_id)");
     }
 
     private void migrateCourseTable(SQLiteDatabase db) {
@@ -138,6 +159,10 @@ public final class DeadlineStore extends SQLiteOpenHelper {
             item.id = item.stableId();
         }
         SQLiteDatabase db = getWritableDatabase();
+        pruneIgnored(db);
+        if (isManuallyIgnored(db, item)) {
+            return;
+        }
         preserveSubmissionState(db, item);
         db.replace("deadlines", null, item.toValues());
         deleteLikelyDuplicates(db, item);
@@ -171,6 +196,9 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         SQLiteDatabase db = getWritableDatabase();
         db.replace("courses", null, values);
         backfillCourseName(db, cleanCourseId, cleanClassId, cleanName);
+        if (isCourseFullyDisabled(cleanName)) {
+            CourseScanScores.forceNeverScan(context, new String[]{cleanCourseId}, new String[]{cleanClassId});
+        }
     }
 
     public String resolveCourse(DeadlineItem item) {
@@ -272,7 +300,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
                 return;
             }
         }
-        long window = "考试".equals(item.type) ? 6L * 60L * 60L * 1000L : 30L * 60L * 1000L;
+        long window = TYPE_HOMEWORK.equals(item.type) ? 6L * 60L * 60L * 1000L : 30L * 60L * 1000L;
         if (!empty(item.title) && hasSubmittedMatch(db,
                 "type = ? AND title = ? AND ABS(due_at - ?) <= ?",
                 new String[]{item.type, item.title, String.valueOf(item.dueAt), String.valueOf(window)})) {
@@ -287,6 +315,67 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         }
     }
 
+    private boolean isManuallyIgnored(SQLiteDatabase db, DeadlineItem item) {
+        if (item == null || item.dueAt <= System.currentTimeMillis()) {
+            return false;
+        }
+        if (!empty(item.id) && hasIgnoredMatch(db, "id = ?", new String[]{item.id})) {
+            return true;
+        }
+        if (!empty(item.taskId) && !empty(item.courseId)) {
+            return hasIgnoredMatch(db,
+                    "type = ? AND course_id = ? AND class_id = ? AND task_id = ?",
+                    new String[]{safe(item.type), safe(item.courseId), safe(item.classId), safe(item.taskId)});
+        }
+        long window = TYPE_HOMEWORK.equals(item.type) ? 6L * 60L * 60L * 1000L : 30L * 60L * 1000L;
+        if (empty(item.title)) {
+            return false;
+        }
+        if (!empty(item.courseId) || !empty(item.classId)) {
+            return hasIgnoredMatch(db,
+                    "type = ? AND course_id = ? AND class_id = ? AND title = ? AND ABS(due_at - ?) <= ?",
+                    new String[]{safe(item.type), safe(item.courseId), safe(item.classId), item.title,
+                            String.valueOf(item.dueAt), String.valueOf(window)});
+        }
+        return hasIgnoredMatch(db,
+                "type = ? AND title = ? AND ABS(due_at - ?) <= ?",
+                new String[]{safe(item.type), item.title, String.valueOf(item.dueAt), String.valueOf(window)});
+    }
+
+    private boolean hasIgnoredMatch(SQLiteDatabase db, String where, String[] args) {
+        try (Cursor cursor = db.query("ignored_deadlines", new String[]{"id"},
+                "due_at > ? AND " + where, mergeArgs(String.valueOf(System.currentTimeMillis()), args),
+                null, null, null, "1")) {
+            return cursor.moveToFirst();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private void rememberIgnored(SQLiteDatabase db, DeadlineItem item) {
+        if (item == null || item.dueAt <= System.currentTimeMillis() || empty(item.id)
+                || empty(item.type) || empty(item.title)) {
+            return;
+        }
+        ContentValues values = new ContentValues();
+        values.put("id", item.id);
+        values.put("type", item.type);
+        values.put("title", item.title);
+        values.put("course_id", safe(item.courseId));
+        values.put("class_id", safe(item.classId));
+        values.put("task_id", safe(item.taskId));
+        values.put("due_at", item.dueAt);
+        values.put("ignored_at", System.currentTimeMillis());
+        db.replace("ignored_deadlines", null, values);
+    }
+
+    private void pruneIgnored(SQLiteDatabase db) {
+        try {
+            db.delete("ignored_deadlines", "due_at <= ?", new String[]{String.valueOf(System.currentTimeMillis())});
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void deleteLikelyDuplicates(SQLiteDatabase db, DeadlineItem item) {
         if (item.type == null || item.title == null || item.id == null) {
             return;
@@ -297,7 +386,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
                     new String[]{item.id, item.type, item.courseId, item.classId == null ? "" : item.classId, item.taskId});
             return;
         }
-        long window = "考试".equals(item.type) ? 6L * 60L * 60L * 1000L : 30L * 60L * 1000L;
+        long window = TYPE_HOMEWORK.equals(item.type) ? 6L * 60L * 60L * 1000L : 30L * 60L * 1000L;
         if (!empty(item.courseId) || !empty(item.classId)) {
             db.delete(
                     "deadlines",
@@ -326,7 +415,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
                 "deadlines", null, where, args, null, null, "due_at ASC")) {
             while (cursor.moveToNext()) {
                 DeadlineItem item = DeadlineItem.fromCursor(cursor);
-                if (!"作业".equals(item.type) && !"考试".equals(item.type)) {
+                if (!TYPE_HOMEWORK.equals(item.type) && !TYPE_EXAM.equals(item.type)) {
                     continue;
                 }
                 resolveCourse(item);
@@ -364,11 +453,21 @@ public final class DeadlineStore extends SQLiteOpenHelper {
 
     public void deleteItem(String id) {
         if (id == null || id.isEmpty()) return;
-        getWritableDatabase().delete("deadlines", "id = ?", new String[]{id});
+        SQLiteDatabase db = getWritableDatabase();
+        try (Cursor cursor = db.query("deadlines", null, "id = ?", new String[]{id},
+                null, null, null, "1")) {
+            if (cursor.moveToFirst()) {
+                rememberIgnored(db, DeadlineItem.fromCursor(cursor));
+            }
+        } catch (Throwable ignored) {
+        }
+        db.delete("deadlines", "id = ?", new String[]{id});
     }
 
     public void clear() {
-        getWritableDatabase().delete("deadlines", null, null);
+        SQLiteDatabase db = getWritableDatabase();
+        db.delete("deadlines", null, null);
+        db.delete("ignored_deadlines", null, null);
     }
 
     public void blockCourseType(String course, String type, boolean blocked) {
@@ -379,24 +478,27 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         if (course == null || course.trim().isEmpty()) {
             return;
         }
-        String key = blockKey(course, type);
-        Set<String> blockedRules = new HashSet<>(blockedRules());
+        String cleanCourse = course.trim();
+        String key = blockKey(cleanCourse, type);
+        Set<String> rules = new HashSet<>(blockedRules());
         if (enabled) {
-            blockedRules.remove(key);
+            rules.remove(key);
         } else {
-            blockedRules.add(key);
+            rules.add(key);
         }
         prefs().edit()
-                .putStringSet(KEY_BLOCKED_RULES, blockedRules)
+                .putStringSet(KEY_BLOCKED_RULES, rules)
                 .apply();
+        syncCourseScanState(cleanCourse);
     }
 
-
     public void clearBlockedCourses() {
+        String[][] refs = allKnownCourseRefs();
         prefs().edit()
                 .remove(KEY_LEGACY_COURSES)
                 .remove(KEY_BLOCKED_RULES)
                 .apply();
+        CourseScanScores.restoreFromNeverScan(context, refs[0], refs[1]);
     }
 
     public Set<String> blockedCourses() {
@@ -411,7 +513,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
     }
 
     public boolean isBlocked(String course) {
-        return isBlocked(course, "全部");
+        return isBlocked(course, TYPE_ALL);
     }
 
     public boolean isBlocked(String course, String type) {
@@ -427,11 +529,22 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         if (legacyCourses.contains(cleanCourse)) {
             return false;
         }
-        Set<String> blocked = blockedRules();
-        if (blocked.contains(blockKey(cleanCourse, "全部")) || blocked.contains(blockKey(cleanCourse, type))) {
-            return false;
+        Set<String> rules = blockedRules();
+        return !rules.contains(blockKey(cleanCourse, TYPE_ALL)) && !rules.contains(blockKey(cleanCourse, type));
+    }
+
+    public void markCourseDisabledByScore(String courseId, String classId, String course) {
+        String cleanCourse = course == null ? "" : course.trim();
+        if (cleanCourse.isEmpty()) {
+            cleanCourse = findCourseName(courseId, classId);
         }
-        return true;
+        if (cleanCourse.isEmpty()) {
+            return;
+        }
+        Set<String> rules = new HashSet<>(blockedRules());
+        rules.add(blockKey(cleanCourse, TYPE_HOMEWORK));
+        rules.add(blockKey(cleanCourse, TYPE_EXAM));
+        prefs().edit().putStringSet(KEY_BLOCKED_RULES, rules).apply();
     }
 
     public List<String> knownCourses() {
@@ -459,8 +572,63 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         return courses;
     }
 
+    private boolean isCourseFullyDisabled(String course) {
+        return isBlocked(course, TYPE_HOMEWORK) && isBlocked(course, TYPE_EXAM);
+    }
+
+    private void syncCourseScanState(String course) {
+        String[][] refs = knownCourseRefs(course);
+        if (refs[0].length == 0) {
+            return;
+        }
+        if (isCourseFullyDisabled(course)) {
+            CourseScanScores.forceNeverScan(context, refs[0], refs[1]);
+        } else {
+            CourseScanScores.restoreFromNeverScan(context, refs[0], refs[1]);
+        }
+    }
+
+    private String[][] knownCourseRefs(String course) {
+        ArrayList<String> courseIds = new ArrayList<>();
+        ArrayList<String> classIds = new ArrayList<>();
+        if (course == null || course.trim().isEmpty()) {
+            return new String[][]{new String[0], new String[0]};
+        }
+        try (Cursor cursor = getReadableDatabase().query("courses", new String[]{"course_id", "class_id"},
+                "name = ?", new String[]{course.trim()}, null, null, null)) {
+            while (cursor.moveToNext()) {
+                String courseId = cursor.getString(0);
+                String classId = cursor.getString(1);
+                if (!empty(courseId)) {
+                    courseIds.add(courseId);
+                    classIds.add(classId == null ? "" : classId);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return new String[][]{courseIds.toArray(new String[0]), classIds.toArray(new String[0])};
+    }
+
+    private String[][] allKnownCourseRefs() {
+        ArrayList<String> courseIds = new ArrayList<>();
+        ArrayList<String> classIds = new ArrayList<>();
+        try (Cursor cursor = getReadableDatabase().query("courses", new String[]{"course_id", "class_id"},
+                null, null, null, null, null)) {
+            while (cursor.moveToNext()) {
+                String courseId = cursor.getString(0);
+                String classId = cursor.getString(1);
+                if (!empty(courseId)) {
+                    courseIds.add(courseId);
+                    classIds.add(classId == null ? "" : classId);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return new String[][]{courseIds.toArray(new String[0]), classIds.toArray(new String[0])};
+    }
+
     private String blockKey(String course, String type) {
-        String normalizedType = type == null || type.trim().isEmpty() ? "全部" : type.trim();
+        String normalizedType = type == null || type.trim().isEmpty() ? TYPE_ALL : type.trim();
         return course.trim() + "|" + normalizedType;
     }
 
@@ -474,10 +642,25 @@ public final class DeadlineStore extends SQLiteOpenHelper {
 
     public void prune() {
         long now = System.currentTimeMillis();
-        getWritableDatabase().delete("deadlines", "due_at <= ?", new String[]{String.valueOf(now)});
+        SQLiteDatabase db = getWritableDatabase();
+        db.delete("deadlines", "due_at <= ? OR submitted != 0", new String[]{String.valueOf(now)});
+        pruneIgnored(db);
+    }
+
+    private static String[] mergeArgs(String first, String[] rest) {
+        String[] result = new String[(rest == null ? 0 : rest.length) + 1];
+        result[0] = first;
+        if (rest != null && rest.length > 0) {
+            System.arraycopy(rest, 0, result, 1, rest.length);
+        }
+        return result;
     }
 
     private static boolean empty(String value) {
         return value == null || value.trim().isEmpty();
+    }
+
+    private static String safe(String value) {
+        return value == null ? "" : value;
     }
 }

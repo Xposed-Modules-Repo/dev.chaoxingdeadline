@@ -34,6 +34,7 @@ import io.github.libxposed.service.XposedService;
  * The app screen only reloads local data; deadline capture is driven by the Chaoxing hook.
  */
 public final class MainActivity extends BaseActivity implements App.ServiceListener {
+    public static final String EXTRA_OPEN_SETTINGS = "dev.chaoxingdeadline.extra.OPEN_SETTINGS";
     private static final String TARGET_PACKAGE = "com.chaoxing.mobile";
 
     private final List<DeadlineItem> items = new ArrayList<>();
@@ -63,6 +64,22 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         DeadlineNotifier.ensureChannel(this);
         requestNotificationPermission();
         reload(true);
+        handleIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIntent(intent);
+    }
+
+    private void handleIntent(Intent intent) {
+        if (intent == null || !intent.getBooleanExtra(EXTRA_OPEN_SETTINGS, false)) {
+            return;
+        }
+        intent.removeExtra(EXTRA_OPEN_SETTINGS);
+        handler.post(() -> startActivity(new Intent(this, SettingsActivity.class)));
     }
 
     @Override

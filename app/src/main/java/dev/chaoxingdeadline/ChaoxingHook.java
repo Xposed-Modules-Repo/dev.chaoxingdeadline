@@ -10,7 +10,9 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -18,8 +20,10 @@ import android.util.Log;
 import android.view.View;
 import android.view.Window;
 import android.webkit.CookieManager;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Space;
 import android.widget.TextView;
 
 import org.json.JSONArray;
@@ -38,8 +42,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -66,15 +72,21 @@ import io.github.libxposed.api.XposedModule;
 
 public final class ChaoxingHook extends XposedModule {
     private static final String TAG = "ChaoxingDeadline";
-    private static final String HOOK_VERSION = "1.2";
+    private static final String HOOK_VERSION = "1.3";
     private static final String TARGET_PACKAGE = "com.chaoxing.mobile";
     private static final String MODULE_PACKAGE = "dev.chaoxingdeadline";
     private static final long AUTO_REFRESH_MIN_GAP_MS = 3L * 60L * 1000L;
-    private static final int COURSE_FETCH_THREADS = 3;
+    private static final long OVERLAY_REALTIME_WAIT_MS = 2000L;
+    private static final String HOME_BUTTON_TAG = "chaoxing_deadline_home_button";
+    private static final int DEFAULT_OVERLAY_WINDOW_HOURS = 24;
+    private static final int OVERLAY_WINDOW_ALL_HOURS = -1;
+    private static final int[] OVERLAY_WINDOW_OPTIONS = {3, 8, 12, 24, 72, OVERLAY_WINDOW_ALL_HOURS};
+    private static final String COURSE_SCAN_PREFS = CourseScanScores.PREFS;
     private static final Object LIFECYCLE_LOCK = new Object();
     private static final ThreadLocal<Boolean> PARSING = ThreadLocal.withInitial(() -> false);
     private static final ArrayList<DeadlineItem> PENDING = new ArrayList<>();
     private static final Set<String> FETCHED_URLS = new HashSet<>();
+    private static final Set<String> COURSE_FIELD_SIGNATURES = new HashSet<>();
     private static final Map<String, String> COURSE_NAMES = new HashMap<>();
     private static final Map<Object, ParseContext> RESPONSE_CONTEXTS = Collections.synchronizedMap(new WeakHashMap<>());
     private static final ArrayList<DeadlineItem> RECENT_ITEMS = new ArrayList<>();
@@ -89,8 +101,17 @@ public final class ChaoxingHook extends XposedModule {
     private static volatile int startedActivityCount;
     private static volatile boolean lifecycleCallbacksRegistered;
     private static volatile boolean overlayDialogShowing;
+    private static volatile boolean homePanelShowing;
     private static volatile boolean overlayScheduled;
     private static volatile boolean overlayRetryAfterDialog;
+    private static volatile int overlayRefreshGeneration;
+    private static volatile int overlayRealtimeShownGeneration = -1;
+    private static volatile long overlayRealtimeShownAt;
+    private static volatile Boolean overlayEnabledOverride;
+    private static volatile int overlayWindowHoursOverride = Integer.MIN_VALUE;
+    private static volatile int lastCourseScanThreads;
+    private static volatile int lastCourseScanRefs;
+    private static volatile int lastCourseScanScanned;
     private static volatile boolean activeRefreshRunning;
     private static volatile boolean foregroundRefreshStarted;
 
@@ -416,6 +437,7 @@ public final class ChaoxingHook extends XposedModule {
                             currentActivityRef = new WeakReference<>(activity);
                             if (isLikelyHomeActivity(activity)) {
                                 lastHomeSeenAt = System.currentTimeMillis();
+                                ensureHomeButton(activity);
                                 maybeShowOverlay(activity, true);
                             }
                         }
@@ -427,12 +449,481 @@ public final class ChaoxingHook extends XposedModule {
         }
     }
 
+    private void ensureHomeButton(Activity activity) {
+        if (!isActivityUsable(activity)) {
+            return;
+        }
+        try {
+            View decor = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
+            FrameLayout content = decor instanceof FrameLayout
+                    ? (FrameLayout) decor
+                    : activity.findViewById(android.R.id.content);
+            if (content == null || content.findViewWithTag(HOME_BUTTON_TAG) != null) {
+                return;
+            }
+            TextView button = new TextView(activity);
+            button.setTag(HOME_BUTTON_TAG);
+            button.setText("Deadline");
+            button.setTextSize(12);
+            button.setTypeface(Typeface.DEFAULT_BOLD);
+            button.setTextColor(Color.WHITE);
+            button.setGravity(android.view.Gravity.CENTER);
+            button.setAlpha(0.94f);
+            button.setClickable(true);
+            button.setFocusable(false);
+            button.setPadding(dp(activity, 12), dp(activity, 8), dp(activity, 12), dp(activity, 8));
+            button.setBackground(UiTheme.fillOnly(activity, UiTheme.accent(activity), dp(activity, 999)));
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                button.setElevation(dp(activity, 24));
+            }
+            button.setOnClickListener(v -> showHomePanel(activity));
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2);
+            params.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
+            params.setMargins(dp(activity, 12), dp(activity, 32), 0, 0);
+            content.addView(button, params);
+            log(Log.INFO, TAG, "home panel button attached");
+        } catch (Throwable throwable) {
+            log(Log.WARN, TAG, "attach home panel button failed: " + throwable);
+        }
+    }
+
+    private void showHomePanel(Activity activity) {
+        if (!isActivityUsable(activity) || homePanelShowing) {
+            return;
+        }
+        boolean shown = false;
+        try {
+            homePanelShowing = true;
+            List<OverlayTodo> todos = homePanelTodos();
+            long updatedAt = overlayDataUpdatedAt();
+            final AlertDialog[] holder = new AlertDialog[1];
+            View content = homePanelView(activity, todos, updatedAt,
+                    () -> safeDismiss(holder[0]),
+                    () -> switchHomePanel(holder[0], () -> showHomeSettingsPanel(activity)));
+            AlertDialog dialog = new AlertDialog.Builder(activity)
+                    .setView(content)
+                    .show();
+            holder[0] = dialog;
+            dialog.setOnDismissListener(d -> homePanelShowing = false);
+            Window window = dialog.getWindow();
+            if (window != null) {
+                int width = (int) (activity.getResources().getDisplayMetrics().widthPixels * 0.92f);
+                window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                window.setLayout(width, -2);
+            }
+            shown = true;
+            log(Log.INFO, TAG, "home panel shown: todos=" + todos.size());
+        } catch (Throwable throwable) {
+            log(Log.WARN, TAG, "show home panel failed: " + throwable);
+        } finally {
+            if (!shown) {
+                homePanelShowing = false;
+            }
+        }
+    }
+
+    private void showHomeSettingsPanel(Activity activity) {
+        if (!isActivityUsable(activity) || homePanelShowing) {
+            return;
+        }
+        boolean shown = false;
+        try {
+            homePanelShowing = true;
+            final AlertDialog[] holder = new AlertDialog[1];
+            View content = homeSettingsView(activity,
+                    () -> switchHomePanel(holder[0], () -> showHomePanel(activity)),
+                    () -> safeDismiss(holder[0]),
+                    () -> {
+                        openModuleSettings(activity);
+                        safeDismiss(holder[0]);
+                    },
+                    () -> {
+                        setOverlayEnabledFromPanel(activity, !overlayEnabled());
+                        switchHomePanel(holder[0], () -> showHomeSettingsPanel(activity));
+                    },
+                    hours -> {
+                        setOverlayWindowFromPanel(activity, hours);
+                        switchHomePanel(holder[0], () -> showHomeSettingsPanel(activity));
+                    });
+            AlertDialog dialog = new AlertDialog.Builder(activity)
+                    .setView(content)
+                    .show();
+            holder[0] = dialog;
+            dialog.setOnDismissListener(d -> homePanelShowing = false);
+            Window window = dialog.getWindow();
+            if (window != null) {
+                int width = (int) (activity.getResources().getDisplayMetrics().widthPixels * 0.92f);
+                window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                window.setLayout(width, -2);
+            }
+            shown = true;
+            log(Log.INFO, TAG, "home settings panel shown");
+        } catch (Throwable throwable) {
+            log(Log.WARN, TAG, "show home settings panel failed: " + throwable);
+        } finally {
+            if (!shown) {
+                homePanelShowing = false;
+            }
+        }
+    }
+
+    private interface OverlayWindowAction {
+        void set(int hours);
+    }
+
+    private List<OverlayTodo> homePanelTodos() {
+        ArrayList<OverlayTodo> todos = new ArrayList<>();
+        long now = System.currentTimeMillis();
+        try {
+            SharedPreferences prefs = getRemotePreferences(OverlayBridge.PREFS);
+            String payload = prefs.getString(OverlayBridge.KEY_ITEMS, "[]");
+            JSONArray array = new JSONArray(payload == null ? "[]" : payload);
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject json = array.optJSONObject(i);
+                if (json == null || json.optBoolean("submitted", false)) {
+                    continue;
+                }
+                addPanelTodo(todos, new OverlayTodo(
+                        json.optString("type", "事项"),
+                        json.optString("title", "未命名"),
+                        json.optString("course", ""),
+                        json.optLong("dueAt", 0L)), now);
+            }
+        } catch (Throwable throwable) {
+            log(Log.WARN, TAG, "read home panel prefs failed: " + throwable);
+        }
+        synchronized (RECENT_ITEMS) {
+            for (DeadlineItem item : RECENT_ITEMS) {
+                if (item == null || item.submitted || item.submissionState == DeadlineItem.SUBMISSION_UNKNOWN) {
+                    continue;
+                }
+                addPanelTodo(todos, new OverlayTodo(item.type, item.title, item.course, item.dueAt), now);
+            }
+        }
+        todos.sort((a, b) -> Long.compare(a.dueAt, b.dueAt));
+        return todos;
+    }
+
+    private void addPanelTodo(List<OverlayTodo> todos, OverlayTodo todo, long now) {
+        if (todo == null || todo.dueAt <= now) {
+            return;
+        }
+        if (!"作业".equals(todo.type) && !"考试".equals(todo.type)) {
+            return;
+        }
+        for (int i = 0; i < todos.size(); i++) {
+            OverlayTodo old = todos.get(i);
+            if (isSameOverlayTodo(old, todo)) {
+                todos.set(i, betterOverlayTodo(old, todo));
+                return;
+            }
+        }
+        todos.add(todo);
+    }
+
+    private long overlayDataUpdatedAt() {
+        try {
+            return getRemotePreferences(OverlayBridge.PREFS).getLong(OverlayBridge.KEY_UPDATED_AT, 0L);
+        } catch (Throwable ignored) {
+            return 0L;
+        }
+    }
+
+    private String homePanelScanStatus() {
+        int refs = lastCourseScanRefs;
+        if (refs > 0) {
+            return "线程：" + Math.max(1, lastCourseScanThreads)
+                    + "｜扫描：" + Math.min(Math.max(0, lastCourseScanScanned), refs)
+                    + "/" + refs + " 门";
+        }
+        try {
+            return CourseScanThreads.summary(courseScanPrefs());
+        } catch (Throwable ignored) {
+            return "线程：" + CourseScanThreads.DEFAULT + "｜暂无扫描记录";
+        }
+    }
+
+    private View homePanelView(Activity activity, List<OverlayTodo> todos, long updatedAt,
+                               Runnable closeAction, Runnable settingsAction) {
+        LinearLayout root = new LinearLayout(activity);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(activity, 20), dp(activity, 18), dp(activity, 20), dp(activity, 16));
+        root.setBackground(UiTheme.rounded(activity, UiTheme.sheet(activity), dp(activity, 22), UiTheme.stroke(activity)));
+
+        LinearLayout header = new LinearLayout(activity);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(android.view.Gravity.CENTER_VERTICAL);
+
+        LinearLayout titles = new LinearLayout(activity);
+        titles.setOrientation(LinearLayout.VERTICAL);
+        TextView title = new TextView(activity);
+        title.setText("Deadline");
+        title.setTextSize(20);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setTextColor(UiTheme.text(activity));
+        titles.addView(title, new LinearLayout.LayoutParams(-1, -2));
+
+        TextView subtitle = new TextView(activity);
+        String updated = updatedAt > 0L ? " · 更新于 " + DateText.deadlineTime(updatedAt) : " · 暂无刷新时间";
+        subtitle.setText("共 " + todos.size() + " 个未完成待办" + updated);
+        subtitle.setTextSize(12);
+        subtitle.setTextColor(UiTheme.muted(activity));
+        subtitle.setPadding(0, dp(activity, 3), 0, 0);
+        titles.addView(subtitle, new LinearLayout.LayoutParams(-1, -2));
+
+        TextView scanStatus = new TextView(activity);
+        scanStatus.setText(homePanelScanStatus());
+        scanStatus.setTextSize(12);
+        scanStatus.setTextColor(UiTheme.muted(activity));
+        scanStatus.setPadding(0, dp(activity, 3), 0, 0);
+        titles.addView(scanStatus, new LinearLayout.LayoutParams(-1, -2));
+        header.addView(titles, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        TextView settings = smallPanelButton(activity, "设置", false);
+        settings.setOnClickListener(v -> {
+            if (settingsAction != null) {
+                settingsAction.run();
+            }
+        });
+        header.addView(settings, new LinearLayout.LayoutParams(-2, -2));
+        root.addView(header, new LinearLayout.LayoutParams(-1, -2));
+
+        LinearLayout list = new LinearLayout(activity);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(0, dp(activity, 14), 0, 0);
+        if (todos.isEmpty()) {
+            TextView empty = new TextView(activity);
+            empty.setText("暂无未完成待办\n打开学习通后会自动刷新");
+            empty.setTextSize(14);
+            empty.setTextColor(UiTheme.muted(activity));
+            empty.setGravity(android.view.Gravity.CENTER);
+            empty.setLineSpacing(0f, 1.2f);
+            empty.setPadding(0, dp(activity, 28), 0, dp(activity, 28));
+            list.addView(empty, new LinearLayout.LayoutParams(-1, -2));
+        } else {
+            for (OverlayTodo todo : todos) {
+                list.addView(overlayRow(activity, todo));
+            }
+        }
+
+        ScrollView scroll = new ScrollView(activity);
+        scroll.setFillViewport(false);
+        scroll.addView(list, new ScrollView.LayoutParams(-1, -2));
+        int maxHeight = Math.min(dp(activity, 460), (int) (activity.getResources().getDisplayMetrics().heightPixels * 0.62f));
+        root.addView(scroll, new LinearLayout.LayoutParams(-1, maxHeight));
+
+        TextView close = smallPanelButton(activity, "关闭", true);
+        close.setOnClickListener(v -> {
+            if (closeAction != null) {
+                closeAction.run();
+            }
+        });
+        LinearLayout.LayoutParams closeParams = new LinearLayout.LayoutParams(-1, -2);
+        closeParams.setMargins(0, dp(activity, 8), 0, 0);
+        root.addView(close, closeParams);
+        return root;
+    }
+
+    private View homeSettingsView(Activity activity, Runnable backAction, Runnable closeAction,
+                                  Runnable fullSettingsAction, Runnable toggleOverlayAction,
+                                  OverlayWindowAction windowAction) {
+        LinearLayout root = new LinearLayout(activity);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(activity, 20), dp(activity, 18), dp(activity, 20), dp(activity, 16));
+        root.setBackground(UiTheme.rounded(activity, UiTheme.sheet(activity), dp(activity, 22), UiTheme.stroke(activity)));
+
+        TextView title = new TextView(activity);
+        title.setText("设置");
+        title.setTextSize(20);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setTextColor(UiTheme.text(activity));
+        root.addView(title, new LinearLayout.LayoutParams(-1, -2));
+
+        Space topSpace = new Space(activity);
+        root.addView(topSpace, new LinearLayout.LayoutParams(1, dp(activity, 12)));
+
+        root.addView(settingsRow(activity,
+                "学习通内弹窗",
+                "控制进入学习通首页时是否显示待办弹窗",
+                overlayEnabled() ? "已开启" : "已关闭",
+                true,
+                toggleOverlayAction));
+
+        TextView section = new TextView(activity);
+        section.setText("弹窗范围");
+        section.setTextSize(13);
+        section.setTypeface(Typeface.DEFAULT_BOLD);
+        section.setTextColor(UiTheme.muted(activity));
+        section.setPadding(0, dp(activity, 12), 0, dp(activity, 6));
+        root.addView(section, new LinearLayout.LayoutParams(-1, -2));
+
+        int currentWindow = overlayWindowHours();
+        for (int option : OVERLAY_WINDOW_OPTIONS) {
+            String label = overlayWindowLabel(option);
+            boolean selected = option == currentWindow;
+            root.addView(settingsRow(activity,
+                    label,
+                    selected ? "当前使用" : "点击切换",
+                    selected ? "✓" : "",
+                    selected,
+                    () -> {
+                        if (windowAction != null) {
+                            windowAction.set(option);
+                        }
+                    }));
+        }
+
+        LinearLayout actions = new LinearLayout(activity);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.setPadding(0, dp(activity, 14), 0, 0);
+        TextView back = smallPanelButton(activity, "返回待办", false);
+        back.setOnClickListener(v -> {
+            if (backAction != null) {
+                backAction.run();
+            }
+        });
+        actions.addView(back, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        TextView full = smallPanelButton(activity, "完整设置", false);
+        full.setOnClickListener(v -> {
+            if (fullSettingsAction != null) {
+                fullSettingsAction.run();
+            }
+        });
+        LinearLayout.LayoutParams fullParams = new LinearLayout.LayoutParams(0, -2, 1f);
+        fullParams.setMargins(dp(activity, 8), 0, 0, 0);
+        actions.addView(full, fullParams);
+        root.addView(actions, new LinearLayout.LayoutParams(-1, -2));
+
+        TextView close = smallPanelButton(activity, "关闭", true);
+        close.setOnClickListener(v -> {
+            if (closeAction != null) {
+                closeAction.run();
+            }
+        });
+        LinearLayout.LayoutParams closeParams = new LinearLayout.LayoutParams(-1, -2);
+        closeParams.setMargins(0, dp(activity, 8), 0, 0);
+        root.addView(close, closeParams);
+        return root;
+    }
+
+    private View settingsRow(Activity activity, String title, String subtitle, String value,
+                             boolean highlighted, Runnable action) {
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(activity, 14), dp(activity, 11), dp(activity, 14), dp(activity, 11));
+        row.setClickable(true);
+        row.setBackground(UiTheme.rounded(activity,
+                highlighted ? UiTheme.card(activity) : UiTheme.sheet(activity),
+                dp(activity, 14), UiTheme.stroke(activity)));
+        if (action != null) {
+            row.setOnClickListener(v -> action.run());
+        }
+
+        LinearLayout texts = new LinearLayout(activity);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        TextView titleView = new TextView(activity);
+        titleView.setText(title);
+        titleView.setTextSize(14);
+        titleView.setTypeface(Typeface.DEFAULT_BOLD);
+        titleView.setTextColor(UiTheme.text(activity));
+        texts.addView(titleView, new LinearLayout.LayoutParams(-1, -2));
+        TextView subView = new TextView(activity);
+        subView.setText(subtitle);
+        subView.setTextSize(12);
+        subView.setTextColor(UiTheme.muted(activity));
+        subView.setPadding(0, dp(activity, 3), 0, 0);
+        texts.addView(subView, new LinearLayout.LayoutParams(-1, -2));
+        row.addView(texts, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        TextView valueView = new TextView(activity);
+        valueView.setText(value);
+        valueView.setTextSize(13);
+        valueView.setTypeface(Typeface.DEFAULT_BOLD);
+        valueView.setTextColor(highlighted ? UiTheme.accent(activity) : UiTheme.muted(activity));
+        valueView.setPadding(dp(activity, 10), 0, 0, 0);
+        row.addView(valueView, new LinearLayout.LayoutParams(-2, -2));
+
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.setMargins(0, 0, 0, dp(activity, 8));
+        row.setLayoutParams(params);
+        return row;
+    }
+
+    private TextView smallPanelButton(Activity activity, String text, boolean primary) {
+        TextView button = new TextView(activity);
+        button.setText(text);
+        button.setTextSize(14);
+        button.setTypeface(Typeface.DEFAULT_BOLD);
+        button.setGravity(android.view.Gravity.CENTER);
+        button.setPadding(dp(activity, 12), dp(activity, 8), dp(activity, 12), dp(activity, 8));
+        if (primary) {
+            button.setTextColor(Color.WHITE);
+            button.setBackground(UiTheme.fillOnly(activity, UiTheme.accent(activity), dp(activity, 12)));
+        } else {
+            button.setTextColor(UiTheme.accent(activity));
+            button.setBackground(UiTheme.rounded(activity, UiTheme.card(activity), dp(activity, 12), UiTheme.stroke(activity)));
+        }
+        return button;
+    }
+
+    private void setOverlayEnabledFromPanel(Context context, boolean enabled) {
+        overlayEnabledOverride = enabled;
+        Intent intent = new Intent(DeadlineReceiver.ACTION_SETTINGS_UPDATE);
+        intent.setComponent(new ComponentName(MODULE_PACKAGE, MODULE_PACKAGE + ".DeadlineReceiver"));
+        intent.putExtra("overlay_enabled", enabled);
+        sendAuthenticatedBroadcast(context, intent, "update overlay enabled");
+    }
+
+    private void setOverlayWindowFromPanel(Context context, int hours) {
+        if (!isOverlayWindowOption(hours)) {
+            return;
+        }
+        overlayWindowHoursOverride = hours;
+        Intent intent = new Intent(DeadlineReceiver.ACTION_SETTINGS_UPDATE);
+        intent.setComponent(new ComponentName(MODULE_PACKAGE, MODULE_PACKAGE + ".DeadlineReceiver"));
+        intent.putExtra("overlay_window_hours", hours);
+        sendAuthenticatedBroadcast(context, intent, "update overlay window");
+    }
+
+    private void sendAuthenticatedBroadcast(Context context, Intent intent, String label) {
+        try {
+            attachBridgeToken(intent);
+            context.sendBroadcast(intent);
+            log(Log.INFO, TAG, label + " sent");
+        } catch (Throwable throwable) {
+            log(Log.WARN, TAG, label + " failed: " + throwable);
+        }
+    }
+
+    private void openModuleSettings(Context context) {
+        try {
+            Intent intent = new Intent();
+            intent.setComponent(new ComponentName(MODULE_PACKAGE, MODULE_PACKAGE + ".MainActivity"));
+            intent.putExtra(MainActivity.EXTRA_OPEN_SETTINGS, true);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            context.startActivity(intent);
+        } catch (Throwable first) {
+            try {
+                Intent fallback = context.getPackageManager().getLaunchIntentForPackage(MODULE_PACKAGE);
+                if (fallback != null) {
+                    fallback.putExtra(MainActivity.EXTRA_OPEN_SETTINGS, true);
+                    fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                    context.startActivity(fallback);
+                }
+            } catch (Throwable second) {
+                log(Log.WARN, TAG, "open module settings failed: " + second);
+            }
+        }
+    }
+
     private void maybeShowOverlay(Activity activity) {
         maybeShowOverlay(activity, true);
     }
 
     private void maybeShowOverlay(Activity activity, boolean requireHomeActivity) {
-        if (activity == null || activity.isFinishing()) {
+        if (!isActivityUsable(activity)) {
             return;
         }
         if (overlayDialogShowing || overlayScheduled) {
@@ -442,77 +933,139 @@ public final class ChaoxingHook extends XposedModule {
             log(Log.INFO, TAG, "overlay skipped: not on home activity");
             return;
         }
-        if (activeRefreshRunning) {
-            log(Log.INFO, TAG, "todo overlay uses cached data while active refresh continues");
-        }
+        long scheduledAt = System.currentTimeMillis();
         overlayScheduled = true;
+        log(Log.INFO, TAG, "overlay waits for realtime data before cache fallback");
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            boolean shown = false;
             try {
-                if (activity.isFinishing() || (requireHomeActivity && !isLikelyHomeActivity(activity))) {
+                if (overlayRealtimeShownAt >= scheduledAt) {
+                    log(Log.INFO, TAG, "overlay cache fallback skipped: realtime shown");
                     return;
                 }
-                if (!overlayEnabled()) {
-                    log(Log.INFO, TAG, "overlay skipped: disabled");
-                    return;
-                }
-                List<OverlayTodo> todos = overlayTodos();
-                log(Log.INFO, TAG, "todo overlay todos=" + todos.size());
-                if (todos.isEmpty()) {
-                    return;
-                }
-                String fingerprint = overlayFingerprint(todos);
-                long now = System.currentTimeMillis();
-                if (fingerprint.equals(lastOverlayFingerprint)) {
-                    log(Log.INFO, TAG, "todo overlay skipped: unchanged");
-                    return;
-                }
-                overlayDialogShowing = true;
-                lastOverlayAt = now;
-                lastOverlayFingerprint = fingerprint;
-                AlertDialog dialog = new AlertDialog.Builder(activity)
-                        .setView(overlayView(activity, todos))
-                        .setPositiveButton("\u77e5\u9053\u4e86", null)
-                        .show();
-                shown = true;
-                dialog.setOnDismissListener(d -> {
-                    overlayDialogShowing = false;
-                    if (overlayRetryAfterDialog) {
-                        overlayRetryAfterDialog = false;
-                        new Handler(Looper.getMainLooper()).postDelayed(() -> maybeShowOverlay(activity, false), 250L);
-                    }
-                });
-                Window window = dialog.getWindow();
-                if (window != null) {
-                    int width = (int) (activity.getResources().getDisplayMetrics().widthPixels * 0.88f);
-                    window.setLayout(width, -2);
-                }
-            } catch (Throwable throwable) {
-                log(Log.WARN, TAG, "show overlay failed: " + throwable);
+                showOverlay(activity, requireHomeActivity, false);
             } finally {
                 overlayScheduled = false;
-                if (!shown) {
-                    overlayDialogShowing = false;
-                }
             }
-        }, 800L);
+        }, OVERLAY_REALTIME_WAIT_MS);
+    }
+
+    private boolean showOverlay(Activity activity, boolean requireHomeActivity, boolean realtime) {
+        boolean shown = false;
+        try {
+            if (!isActivityUsable(activity) || (requireHomeActivity && !isLikelyHomeActivity(activity))) {
+                return false;
+            }
+            if (overlayDialogShowing) {
+                if (realtime) {
+                    overlayRetryAfterDialog = true;
+                }
+                return false;
+            }
+            if (!overlayEnabled()) {
+                log(Log.INFO, TAG, "overlay skipped: disabled");
+                return false;
+            }
+            List<OverlayTodo> todos = overlayTodos(realtime);
+            log(Log.INFO, TAG, (realtime ? "realtime" : "cache") + " overlay todos=" + todos.size());
+            if (todos.isEmpty()) {
+                return false;
+            }
+            String fingerprint = overlayFingerprint(todos);
+            long now = System.currentTimeMillis();
+            if (fingerprint.equals(lastOverlayFingerprint)) {
+                log(Log.INFO, TAG, "overlay skipped: unchanged");
+                return false;
+            }
+            overlayDialogShowing = true;
+            lastOverlayAt = now;
+            lastOverlayFingerprint = fingerprint;
+            final AlertDialog[] holder = new AlertDialog[1];
+            View content = overlayView(activity, todos, realtime, () -> safeDismiss(holder[0]));
+            AlertDialog dialog = new AlertDialog.Builder(activity)
+                    .setView(content)
+                    .show();
+            holder[0] = dialog;
+            shown = true;
+            if (realtime) {
+                overlayRealtimeShownGeneration = overlayRefreshGeneration;
+                overlayRealtimeShownAt = System.currentTimeMillis();
+            }
+            dialog.setOnDismissListener(d -> {
+                overlayDialogShowing = false;
+                if (overlayRetryAfterDialog) {
+                    overlayRetryAfterDialog = false;
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> showOverlay(activity, false, true), 250L);
+                }
+            });
+            Window window = dialog.getWindow();
+            if (window != null) {
+                int width = (int) (activity.getResources().getDisplayMetrics().widthPixels * 0.88f);
+                window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                window.setLayout(width, -2);
+            }
+        } catch (Throwable throwable) {
+            log(Log.WARN, TAG, "show overlay failed: " + throwable);
+        } finally {
+            if (!shown) {
+                overlayDialogShowing = false;
+            }
+        }
+        return shown;
+    }
+
+    private static boolean isActivityUsable(Activity activity) {
+        if (activity == null || activity.isFinishing()) {
+            return false;
+        }
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN_MR1 || !activity.isDestroyed();
+    }
+
+    private static void switchHomePanel(AlertDialog dialog, Runnable next) {
+        try {
+            if (dialog != null) {
+                dialog.setOnDismissListener(null);
+            }
+        } catch (Throwable ignored) {
+            // Some host windows disappear while Chaoxing switches pages.
+        }
+        safeDismiss(dialog);
+        homePanelShowing = false;
+        if (next != null) {
+            next.run();
+        }
+    }
+
+    private static void safeDismiss(AlertDialog dialog) {
+        if (dialog == null) {
+            return;
+        }
+        try {
+            dialog.dismiss();
+        } catch (Throwable ignored) {
+            // Host Activity windows can disappear while Chaoxing switches pages.
+        }
     }
 
     private void maybeShowOverlayAfterRefresh() {
         WeakReference<Activity> ref = currentActivityRef;
         Activity activity = ref == null ? null : ref.get();
-        if (activity == null || activity.isFinishing()) {
+        if (!isActivityUsable(activity)) {
             return;
         }
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            if (overlayDialogShowing || overlayScheduled) {
+        new Handler(Looper.getMainLooper()).post(() -> {
+            if (overlayDialogShowing) {
                 overlayRetryAfterDialog = true;
+                return;
             }
-            maybeShowOverlay(activity, false);
-        }, 900L);
+            showOverlay(activity, false, true);
+        });
     }
 
     private boolean overlayEnabled() {
+        Boolean override = overlayEnabledOverride;
+        if (override != null) {
+            return override;
+        }
         try {
             return getRemotePreferences("app_settings").getBoolean("overlay_enabled", true);
         } catch (Throwable ignored) {
@@ -520,7 +1073,7 @@ public final class ChaoxingHook extends XposedModule {
         }
     }
 
-    private List<OverlayTodo> overlayTodos() {
+    private List<OverlayTodo> overlayTodos(boolean includeRecentItems) {
         ArrayList<OverlayTodo> todos = new ArrayList<>();
         long now = System.currentTimeMillis();
         List<OverlayTodo> suppressed = new ArrayList<>();
@@ -564,19 +1117,21 @@ public final class ChaoxingHook extends XposedModule {
         } catch (Throwable throwable) {
             log(Log.WARN, TAG, "read overlay prefs failed: " + throwable);
         }
-        synchronized (RECENT_ITEMS) {
-            for (int i = RECENT_ITEMS.size() - 1; i >= 0; i--) {
-                DeadlineItem item = RECENT_ITEMS.get(i);
-                if (item == null || item.submitted) {
-                    RECENT_ITEMS.remove(i);
-                    continue;
+        if (includeRecentItems) {
+            synchronized (RECENT_ITEMS) {
+                for (int i = RECENT_ITEMS.size() - 1; i >= 0; i--) {
+                    DeadlineItem item = RECENT_ITEMS.get(i);
+                    if (item == null || item.submitted) {
+                        RECENT_ITEMS.remove(i);
+                        continue;
+                    }
+                    OverlayTodo todo = new OverlayTodo(item.type, item.title, item.course, item.dueAt);
+                    if (isSuppressedOverlayTodo(todo, suppressed)) {
+                        RECENT_ITEMS.remove(i);
+                        continue;
+                    }
+                    addOverlayTodo(todos, todo, now);
                 }
-                OverlayTodo todo = new OverlayTodo(item.type, item.title, item.course, item.dueAt);
-                if (isSuppressedOverlayTodo(todo, suppressed)) {
-                    RECENT_ITEMS.remove(i);
-                    continue;
-                }
-                addOverlayTodo(todos, todo, now);
             }
         }
         todos.sort((a, b) -> Long.compare(a.dueAt, b.dueAt));
@@ -596,7 +1151,7 @@ public final class ChaoxingHook extends XposedModule {
     }
 
     private void addOverlayTodo(List<OverlayTodo> todos, OverlayTodo todo, long now) {
-        if (todo == null || !isUrgentDue(todo.dueAt, now)) {
+        if (todo == null || !isInOverlayWindow(todo.dueAt, now)) {
             return;
         }
         if (!"\u4f5c\u4e1a".equals(todo.type) && !"\u8003\u8bd5".equals(todo.type)) {
@@ -639,8 +1194,47 @@ public final class ChaoxingHook extends XposedModule {
         return new OverlayTodo(safe(a.type).isEmpty() ? b.type : a.type, title, course, dueAt);
     }
 
-    private boolean isUrgentDue(long dueAt, long now) {
-        return dueAt > now;
+    private boolean isInOverlayWindow(long dueAt, long now) {
+        if (dueAt <= now) {
+            return false;
+        }
+        int hours = overlayWindowHours();
+        if (hours == OVERLAY_WINDOW_ALL_HOURS) {
+            return true;
+        }
+        return dueAt - now <= TimeUnit.HOURS.toMillis(hours);
+    }
+
+    private int overlayWindowHours() {
+        int override = overlayWindowHoursOverride;
+        if (isOverlayWindowOption(override)) {
+            return override;
+        }
+        try {
+            int value = getRemotePreferences("app_settings").getInt("overlay_window_hours", DEFAULT_OVERLAY_WINDOW_HOURS);
+            return isOverlayWindowOption(value) ? value : DEFAULT_OVERLAY_WINDOW_HOURS;
+        } catch (Throwable ignored) {
+            return DEFAULT_OVERLAY_WINDOW_HOURS;
+        }
+    }
+
+    private boolean isOverlayWindowOption(int value) {
+        return value == 3 || value == 8 || value == 12 || value == 24 || value == 72
+                || value == OVERLAY_WINDOW_ALL_HOURS;
+    }
+
+    private String overlayWindowLabel() {
+        return overlayWindowLabel(overlayWindowHours());
+    }
+
+    private String overlayWindowLabel(int hours) {
+        if (hours == OVERLAY_WINDOW_ALL_HOURS) {
+            return "所有未完成";
+        }
+        if (hours == 72) {
+            return "3天内";
+        }
+        return hours + "小时内";
     }
 
     private String overlayFingerprint(List<OverlayTodo> todos) {
@@ -670,32 +1264,35 @@ public final class ChaoxingHook extends XposedModule {
         return value == null ? "" : value.trim();
     }
 
-    private View overlayView(Activity activity, List<OverlayTodo> todos) {
+    private View overlayView(Activity activity, List<OverlayTodo> todos, boolean realtime, Runnable closeAction) {
         LinearLayout root = new LinearLayout(activity);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(activity, 20), dp(activity, 18), dp(activity, 20), dp(activity, 6));
+        root.setPadding(dp(activity, 20), dp(activity, 18), dp(activity, 20), dp(activity, 16));
+        root.setBackground(UiTheme.rounded(activity, UiTheme.sheet(activity), dp(activity, 22), UiTheme.stroke(activity)));
 
         TextView title = new TextView(activity);
-        title.setText("\u5b66\u4e60\u901a\u5f85\u529e");
+        title.setText(overlayWindowHours() == OVERLAY_WINDOW_ALL_HOURS ? "待办提醒" : "\u4e34\u8fd1\u622a\u6b62\u5f85\u529e");
         title.setTextSize(20);
         title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextColor(Color.rgb(248, 250, 252));
+        title.setTextColor(UiTheme.text(activity));
         root.addView(title, new LinearLayout.LayoutParams(-1, -2));
 
         TextView count = new TextView(activity);
-        count.setText("\u5171 " + todos.size() + " \u4e2a\u672a\u5b8c\u6210\u5f85\u529e");
+        count.setText(overlayWindowLabel() + "\u5171 " + todos.size() + " \u4e2a\u5f85\u529e");
         count.setTextSize(13);
-        count.setTextColor(Color.rgb(148, 163, 184));
+        count.setTextColor(UiTheme.muted(activity));
         count.setPadding(0, dp(activity, 4), 0, dp(activity, 4));
         root.addView(count, new LinearLayout.LayoutParams(-1, -2));
 
-        TextView notice = new TextView(activity);
-        notice.setText("本次结果仅依据上次刷新得出的判断，无法判断最新待办，仅供参考");
-        notice.setTextSize(12);
-        notice.setTextColor(Color.rgb(96, 165, 250));
-        notice.setLineSpacing(0f, 1.12f);
-        notice.setPadding(0, 0, 0, dp(activity, 14));
-        root.addView(notice, new LinearLayout.LayoutParams(-1, -2));
+        if (!realtime) {
+            TextView notice = new TextView(activity);
+            notice.setText("本次结果仅依据上次刷新得出的判断，无法判断最新待办，仅供参考");
+            notice.setTextSize(12);
+            notice.setTextColor(UiTheme.accent(activity));
+            notice.setLineSpacing(0f, 1.12f);
+            notice.setPadding(0, 0, 0, dp(activity, 14));
+            root.addView(notice, new LinearLayout.LayoutParams(-1, -2));
+        }
 
         LinearLayout list = new LinearLayout(activity);
         list.setOrientation(LinearLayout.VERTICAL);
@@ -708,6 +1305,23 @@ public final class ChaoxingHook extends XposedModule {
         scroll.addView(list, new ScrollView.LayoutParams(-1, -2));
         int maxHeight = Math.min(dp(activity, 380), (int) (activity.getResources().getDisplayMetrics().heightPixels * 0.52f));
         root.addView(scroll, new LinearLayout.LayoutParams(-1, maxHeight));
+
+        TextView close = new TextView(activity);
+        close.setText("知道了");
+        close.setTextSize(15);
+        close.setTypeface(Typeface.DEFAULT_BOLD);
+        close.setGravity(android.view.Gravity.CENTER);
+        close.setTextColor(Color.WHITE);
+        close.setBackground(UiTheme.fillOnly(activity, UiTheme.accent(activity), dp(activity, 12)));
+        close.setPadding(0, dp(activity, 10), 0, dp(activity, 10));
+        close.setOnClickListener(v -> {
+            if (closeAction != null) {
+                closeAction.run();
+            }
+        });
+        LinearLayout.LayoutParams closeParams = new LinearLayout.LayoutParams(-1, -2);
+        closeParams.setMargins(0, dp(activity, 8), 0, 0);
+        root.addView(close, closeParams);
         return root;
     }
 
@@ -718,17 +1332,15 @@ public final class ChaoxingHook extends XposedModule {
         LinearLayout row = new LinearLayout(activity);
         row.setOrientation(LinearLayout.VERTICAL);
         row.setPadding(dp(activity, 14), dp(activity, 12), dp(activity, 14), dp(activity, 12));
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(urgent ? Color.rgb(64, 42, 42) : Color.rgb(38, 43, 55));
-        bg.setCornerRadius(dp(activity, 14));
-        bg.setStroke(dp(activity, 1), urgent ? Color.rgb(127, 55, 55) : Color.rgb(51, 65, 85));
-        row.setBackground(bg);
+        int rowBg = urgent ? UiTheme.dangerBg(activity) : UiTheme.card(activity);
+        int rowStroke = urgent ? overlayDangerStroke(activity) : UiTheme.stroke(activity);
+        row.setBackground(UiTheme.rounded(activity, rowBg, dp(activity, 14), rowStroke));
 
         TextView title = new TextView(activity);
         title.setText(todo.title == null || todo.title.isEmpty() ? "\u672a\u547d\u540d" : todo.title);
         title.setTextSize(16);
         title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextColor(Color.rgb(248, 250, 252));
+        title.setTextColor(UiTheme.text(activity));
         title.setLineSpacing(0f, 1.08f);
         row.addView(title, new LinearLayout.LayoutParams(-1, -2));
 
@@ -736,7 +1348,7 @@ public final class ChaoxingHook extends XposedModule {
             TextView course = new TextView(activity);
             course.setText(todo.course);
             course.setTextSize(13);
-            course.setTextColor(Color.rgb(148, 163, 184));
+            course.setTextColor(UiTheme.muted(activity));
             course.setPadding(0, dp(activity, 5), 0, 0);
             row.addView(course, new LinearLayout.LayoutParams(-1, -2));
         }
@@ -750,11 +1362,10 @@ public final class ChaoxingHook extends XposedModule {
         badge.setText(todo.type);
         badge.setTextSize(12);
         badge.setTypeface(Typeface.DEFAULT_BOLD);
-        badge.setTextColor("\u8003\u8bd5".equals(todo.type) ? Color.rgb(251, 146, 60) : Color.rgb(96, 165, 250));
-        GradientDrawable badgeBg = new GradientDrawable();
-        badgeBg.setColor("\u8003\u8bd5".equals(todo.type) ? Color.argb(40, 251, 146, 60) : Color.argb(40, 96, 165, 250));
-        badgeBg.setCornerRadius(dp(activity, 999));
-        badge.setBackground(badgeBg);
+        boolean exam = "\u8003\u8bd5".equals(todo.type);
+        badge.setTextColor(exam ? UiTheme.badgeExam(activity) : UiTheme.badgeHomework(activity));
+        badge.setBackground(UiTheme.fillOnly(activity,
+                exam ? UiTheme.badgeExamBg(activity) : UiTheme.badgeHomeworkBg(activity), dp(activity, 999)));
         badge.setPadding(dp(activity, 8), dp(activity, 3), dp(activity, 8), dp(activity, 3));
         meta.addView(badge, new LinearLayout.LayoutParams(-2, -2));
 
@@ -762,7 +1373,7 @@ public final class ChaoxingHook extends XposedModule {
         due.setText(DateText.dueLine(todo.dueAt));
         due.setTextSize(13);
         due.setTypeface(Typeface.DEFAULT_BOLD);
-        due.setTextColor(urgent ? Color.rgb(248, 113, 113) : Color.rgb(203, 213, 225));
+        due.setTextColor(urgent ? overlayDangerText(activity) : UiTheme.muted(activity));
         due.setGravity(android.view.Gravity.END | android.view.Gravity.CENTER_VERTICAL);
         due.setLineSpacing(0f, 1.05f);
         LinearLayout.LayoutParams dueParams = new LinearLayout.LayoutParams(0, -2, 1f);
@@ -806,6 +1417,14 @@ public final class ChaoxingHook extends XposedModule {
                 && (lower.contains("main") || lower.contains("home") || lower.contains("course"))) {
             lastHomeSeenAt = System.currentTimeMillis();
         }
+    }
+
+    private int overlayDangerStroke(Context context) {
+        return UiTheme.dark(context) ? Color.rgb(127, 55, 55) : Color.rgb(255, 190, 200);
+    }
+
+    private int overlayDangerText(Context context) {
+        return UiTheme.dark(context) ? Color.rgb(248, 113, 113) : Color.rgb(194, 65, 72);
     }
 
     private int dp(Context context, int value) {
@@ -854,28 +1473,30 @@ public final class ChaoxingHook extends XposedModule {
         WeakReference<Activity> ref = currentActivityRef;
         Activity activity = ref == null ? null : ref.get();
         if (activity != null) {
-            if (isUrgentDue(item.dueAt, System.currentTimeMillis()) && (overlayDialogShowing || overlayScheduled)) {
+            if (isInOverlayWindow(item.dueAt, System.currentTimeMillis()) && (overlayDialogShowing || overlayScheduled)) {
                 overlayRetryAfterDialog = true;
             }
-            maybeShowOverlay(activity);
+            if (!activeRefreshRunning) {
+                maybeShowOverlay(activity);
+            }
         }
     }
 
-    private void inspect(String text, String source) {
-        inspect(text, ParseContext.fromSource(source, ""));
+    private int inspect(String text, String source) {
+        return inspect(text, ParseContext.fromSource(source, ""));
     }
 
-    private void inspect(String text, ParseContext context) {
+    private int inspect(String text, ParseContext context) {
         ParseContext ctx = context == null ? ParseContext.simple("") : context;
         if (Boolean.TRUE.equals(PARSING.get())) {
-            return;
+            return 0;
         }
         collectAndFetchCourseTasks(text, ctx);
         PARSING.set(true);
         try {
             List<DeadlineItem> items = DeadlineParser.parsePayload(text, ctx);
             if (items.isEmpty()) {
-                return;
+                return 0;
             }
             log(Log.INFO, TAG, String.format(Locale.ROOT, "hook v" + HOOK_VERSION + " found %d deadline items from %s", items.size(), ctx.source));
             for (DeadlineItem item : items) {
@@ -885,8 +1506,10 @@ public final class ChaoxingHook extends XposedModule {
                 emit(item);
             }
             emitStatus("captured " + items.size(), ctx.source);
+            return items.size();
         } catch (Throwable throwable) {
             log(Log.WARN, TAG, "parse failed: " + throwable);
+            return 0;
         } finally {
             PARSING.set(false);
         }
@@ -973,6 +1596,7 @@ public final class ChaoxingHook extends XposedModule {
             }
             lastAutoRefreshAt = now;
             activeRefreshRunning = true;
+            overlayRefreshGeneration++;
         }
         activeRefresh(reason);
     }
@@ -1007,21 +1631,21 @@ public final class ChaoxingHook extends XposedModule {
         worker.start();
     }
 
-    private void fetchUrl(String url, String source) {
-        fetchUrl(url, ParseContext.fromSource(source, url));
+    private int fetchUrl(String url, String source) {
+        return fetchUrl(url, ParseContext.fromSource(source, url));
     }
 
-    private void fetchUrl(String url, ParseContext context) {
+    private int fetchUrl(String url, ParseContext context) {
         ParseContext ctx = context == null ? ParseContext.fromSource("", url) : context.withUrl(url);
         String source = ctx.source;
         boolean guardedUrl = source != null && source.startsWith("active.courseList");
         if (guardedUrl && System.currentTimeMillis() < antiSpiderUntil) {
             log(Log.WARN, TAG, "skip active fetch while antispider cooldown is active");
-            return;
+            return -1;
         }
         synchronized (FETCHED_URLS) {
             if (!FETCHED_URLS.add(url)) {
-                return;
+                return 0;
             }
             if (FETCHED_URLS.size() > 800) {
                 FETCHED_URLS.clear();
@@ -1063,11 +1687,12 @@ public final class ChaoxingHook extends XposedModule {
                 antiSpiderUntil = System.currentTimeMillis() + 30L * 60L * 1000L;
                 log(Log.WARN, TAG, "chapter fetch paused because Chaoxing requested verification");
                 emitStatus("章节接口触发验证码，已暂停一会儿", source);
-                return;
+                return -1;
             }
-            inspect(body, ctx);
+            return inspect(body, ctx);
         } catch (Throwable throwable) {
             log(Log.WARN, TAG, "fetch failed " + url + ": " + throwable);
+            return -1;
         } finally {
             if (connection != null) {
                 connection.disconnect();
@@ -1102,6 +1727,7 @@ public final class ChaoxingHook extends XposedModule {
             ArrayList<CourseRef> refs = new ArrayList<>();
             collectCourseRefs(root, refs, 0);
             for (CourseRef ref : refs) {
+                logCourseFieldSummary(ref);
                 rememberCourse(ref);
             }
             log(Log.INFO, TAG, "course refs cached from " + source + ": " + refs.size());
@@ -1112,28 +1738,35 @@ public final class ChaoxingHook extends XposedModule {
     }
 
     private void fetchCourseDeadlines(List<CourseRef> refs) throws InterruptedException {
-        if (refs == null || refs.isEmpty()) {
+        List<CourseRef> plan = courseScanPlan(refs);
+        if (plan.isEmpty()) {
+            log(Log.INFO, TAG, "course deadline scan skipped: no eligible courses");
             return;
         }
+        long startedAt = System.currentTimeMillis();
         String cookieUid = uidFromCookies();
-        AtomicInteger submitted = new AtomicInteger();
+        AtomicInteger scheduled = new AtomicInteger();
         AtomicInteger scanned = new AtomicInteger();
-        ExecutorService executor = Executors.newFixedThreadPool(COURSE_FETCH_THREADS, runnable -> {
+        AtomicInteger foundItems = new AtomicInteger();
+        List<CourseScanResult> results = Collections.synchronizedList(new ArrayList<>());
+        int threadCount = courseFetchThreads();
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount, runnable -> {
             Thread thread = new Thread(runnable, "ChaoxingDeadlineCourseScan");
             thread.setDaemon(true);
             return thread;
         });
         try {
-            for (CourseRef ref : refs) {
-                if (ref == null || ref.courseId.isEmpty() || ref.classId.isEmpty()) {
-                    continue;
-                }
-                int index = submitted.incrementAndGet();
+            for (CourseRef ref : plan) {
+                int index = scheduled.incrementAndGet();
                 executor.execute(() -> {
                     try {
-                        Thread.sleep((long) (index % COURSE_FETCH_THREADS) * 160L);
-                        fetchCourseDeadline(ref, cookieUid);
-                        scanned.incrementAndGet();
+                        Thread.sleep((long) (index % threadCount) * 40L);
+                        int found = fetchCourseDeadline(ref, cookieUid);
+                        if (found >= 0) {
+                            results.add(new CourseScanResult(ref, found > 0));
+                            foundItems.addAndGet(found);
+                            scanned.incrementAndGet();
+                        }
                     } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
                     } catch (Throwable throwable) {
@@ -1144,27 +1777,218 @@ public final class ChaoxingHook extends XposedModule {
         } finally {
             executor.shutdown();
         }
-        if (!executor.awaitTermination(90L, TimeUnit.SECONDS)) {
+        boolean completed = executor.awaitTermination(90L, TimeUnit.SECONDS);
+        if (!completed) {
             executor.shutdownNow();
-            log(Log.WARN, TAG, "course deadline scan timeout: " + scanned.get() + "/" + submitted.get());
+            log(Log.WARN, TAG, "course deadline scan timeout: " + scanned.get() + "/" + scheduled.get()
+                    + ", score update skipped");
+        } else {
+            emitCourseScanBatch(results);
         }
-        log(Log.INFO, TAG, "course deadline scan complete: " + scanned.get() + "/" + submitted.get()
-                + " courses, threads=" + COURSE_FETCH_THREADS);
+        long elapsed = System.currentTimeMillis() - startedAt;
+        lastCourseScanThreads = threadCount;
+        lastCourseScanRefs = refs.size();
+        lastCourseScanScanned = scanned.get();
+        emitCourseScanPerformance(threadCount, elapsed, refs.size(), scheduled.get(), scanned.get());
+        log(Log.INFO, TAG, "course deadline scan complete: " + scanned.get() + "/" + scheduled.get()
+                + " courses, refs=" + refs.size() + ", items=" + foundItems.get()
+                + ", elapsed=" + elapsed + "ms, threads=" + threadCount);
     }
 
-    private void fetchCourseDeadline(CourseRef ref, String cookieUid) {
+    private int fetchCourseDeadline(CourseRef ref, String cookieUid) {
         String refUid = ref.uid.isEmpty() ? cookieUid : ref.uid;
         String uid = refUid.isEmpty() ? "" : "&uid=" + urlEncode(refUid);
         String cpi = ref.cpi.isEmpty() ? "" : "&cpi=" + urlEncode(ref.cpi);
-        fetchUrl("https://mooc1-api.chaoxing.com/work/task-list?courseId="
+        int failures = 0;
+        int found = 0;
+        int result = fetchUrl("https://mooc1-api.chaoxing.com/work/task-list?courseId="
                         + urlEncode(ref.courseId) + "&classId=" + urlEncode(ref.classId) + cpi,
                 parseContextForCourse("active.workList", ref, refUid));
-        fetchUrl("https://mobilelearn.chaoxing.com/ppt/activeAPI/taskactivelist?courseId="
+        if (result < 0) {
+            failures++;
+        } else {
+            found += result;
+        }
+        result = fetchUrl("https://mobilelearn.chaoxing.com/ppt/activeAPI/taskactivelist?courseId="
                         + urlEncode(ref.courseId) + "&classId=" + urlEncode(ref.classId) + uid,
                 parseContextForCourse("active.taskList", ref, refUid));
-        fetchUrl("https://mooc1-api.chaoxing.com/mooc-ans/exam/phone/task-list?courseId="
+        if (result < 0) {
+            failures++;
+        } else {
+            found += result;
+        }
+        result = fetchUrl("https://mooc1-api.chaoxing.com/mooc-ans/exam/phone/task-list?courseId="
                         + urlEncode(ref.courseId) + "&classId=" + urlEncode(ref.classId) + cpi,
                 parseContextForCourse("active.examList", ref, refUid));
+        if (result < 0) {
+            failures++;
+        } else {
+            found += result;
+        }
+        if (failures > 0 && found == 0) {
+            return -1;
+        }
+        return found;
+    }
+
+    private List<CourseRef> courseScanPlan(List<CourseRef> refs) {
+        long startedAt = System.currentTimeMillis();
+        LinkedHashMap<String, CourseRef> unique = new LinkedHashMap<>();
+        if (refs != null) {
+            for (CourseRef ref : refs) {
+                if (ref == null || ref.courseId.isEmpty() || ref.classId.isEmpty()) {
+                    continue;
+                }
+                unique.putIfAbsent(courseKey(ref), ref);
+            }
+        }
+        ArrayList<CourseRef> candidates = new ArrayList<>(unique.values());
+        SharedPreferences prefs = courseScanPrefs();
+        if (prefs == null) {
+            return candidates;
+        }
+        long now = System.currentTimeMillis();
+        ArrayList<CourseRef> result = new ArrayList<>();
+        int skipped = 0;
+        for (CourseRef ref : candidates) {
+            if (shouldScanCourse(ref, prefs, now)) {
+                result.add(ref);
+            } else {
+                skipped++;
+            }
+        }
+        result.sort(Comparator
+                .comparingInt((CourseRef ref) -> CourseScanScores.score(prefs, courseKey(ref))).reversed()
+                .thenComparingLong(ref -> CourseScanScores.lastScanAt(prefs, courseKey(ref)))
+                .thenComparing(ref -> safe(ref.courseName)));
+        long elapsed = System.currentTimeMillis() - startedAt;
+        log(Log.INFO, TAG, "course scan plan: selected=" + result.size()
+                + ", skipped=" + skipped + ", refs=" + (refs == null ? 0 : refs.size())
+                + ", elapsed=" + elapsed + "ms");
+        return result;
+    }
+
+    private boolean shouldScanCourse(CourseRef ref, SharedPreferences prefs, long now) {
+        return CourseScanScores.shouldScan(prefs, courseKey(ref), now);
+    }
+
+    private int courseFetchThreads() {
+        return CourseScanThreads.current(courseScanPrefs());
+    }
+
+    private void emitCourseScanPerformance(int threads, long elapsedMs, int refs, int scheduled, int scanned) {
+        Context context = ensureHostContext();
+        if (context == null || scheduled <= 0 || elapsedMs <= 0L) {
+            return;
+        }
+        try {
+            Intent intent = new Intent(DeadlineReceiver.ACTION_COURSE_SCAN_PERF);
+            intent.setComponent(new ComponentName(MODULE_PACKAGE, MODULE_PACKAGE + ".DeadlineReceiver"));
+            intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+            intent.putExtra("threads", threads);
+            intent.putExtra("elapsed_ms", elapsedMs);
+            intent.putExtra("refs", refs);
+            intent.putExtra("scheduled", scheduled);
+            intent.putExtra("scanned", scanned);
+            attachBridgeToken(intent);
+            context.sendBroadcast(intent);
+        } catch (Throwable throwable) {
+            log(Log.WARN, TAG, "course scan perf emit failed: " + throwable.getClass().getSimpleName());
+        }
+    }
+
+    private void emitCourseScanBatch(List<CourseScanResult> results) {
+        Context context = ensureHostContext();
+        if (context == null || results == null || results.isEmpty()) {
+            return;
+        }
+        try {
+            ArrayList<String> courseIds = new ArrayList<>();
+            ArrayList<String> classIds = new ArrayList<>();
+            ArrayList<String> courseNames = new ArrayList<>();
+            boolean[] foundDeadlines = new boolean[results.size()];
+            int count = 0;
+            synchronized (results) {
+                for (CourseScanResult result : results) {
+                    if (result == null || result.ref == null) {
+                        continue;
+                    }
+                    courseIds.add(result.ref.courseId);
+                    classIds.add(result.ref.classId);
+                    courseNames.add(result.ref.courseName);
+                    foundDeadlines[count] = result.foundDeadline;
+                    count++;
+                }
+            }
+            if (count <= 0) {
+                return;
+            }
+            if (count != foundDeadlines.length) {
+                boolean[] compact = new boolean[count];
+                System.arraycopy(foundDeadlines, 0, compact, 0, count);
+                foundDeadlines = compact;
+            }
+            Intent intent = new Intent(DeadlineReceiver.ACTION_COURSE_SCAN_BATCH);
+            intent.setComponent(new ComponentName(MODULE_PACKAGE, MODULE_PACKAGE + ".DeadlineReceiver"));
+            intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+            intent.putExtra("course_ids", courseIds.toArray(new String[0]));
+            intent.putExtra("class_ids", classIds.toArray(new String[0]));
+            intent.putExtra("course_names", courseNames.toArray(new String[0]));
+            intent.putExtra("found_deadlines", foundDeadlines);
+            attachBridgeToken(intent);
+            context.sendBroadcast(intent);
+            log(Log.INFO, TAG, "course scan score batch emitted: " + count + " courses");
+        } catch (Throwable throwable) {
+            log(Log.WARN, TAG, "course scan batch emit failed: " + throwable.getClass().getSimpleName());
+        }
+    }
+
+    private SharedPreferences courseScanPrefs() {
+        try {
+            return getRemotePreferences(COURSE_SCAN_PREFS);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private String courseKey(CourseRef ref) {
+        if (ref == null) {
+            return "";
+        }
+        return safe(ref.courseId) + "|" + safe(ref.classId);
+    }
+
+    private void logCourseFieldSummary(CourseRef ref) {
+        if (ref == null || ref.raw.isEmpty()) {
+            return;
+        }
+        try {
+            JSONObject object = new JSONObject(ref.raw);
+            ArrayList<String> keys = new ArrayList<>();
+            Iterator<String> iterator = object.keys();
+            while (iterator.hasNext() && keys.size() < 80) {
+                keys.add(iterator.next());
+            }
+            Collections.sort(keys);
+            String signature = keys.toString();
+            synchronized (COURSE_FIELD_SIGNATURES) {
+                if (COURSE_FIELD_SIGNATURES.size() >= 8 || COURSE_FIELD_SIGNATURES.contains(signature)) {
+                    return;
+                }
+                COURSE_FIELD_SIGNATURES.add(signature);
+            }
+            ArrayList<String> timeLike = new ArrayList<>();
+            for (String key : keys) {
+                String lower = key.toLowerCase(Locale.ROOT);
+                if (lower.contains("time") || lower.contains("date") || lower.contains("start")
+                        || lower.contains("begin") || lower.contains("end") || lower.contains("create")
+                        || lower.contains("update")) {
+                    timeLike.add(key);
+                }
+            }
+            log(Log.INFO, TAG, "course raw fields: keys=" + signature + ", timeLike=" + timeLike);
+        } catch (Throwable ignored) {
+        }
     }
 
     private void rememberCourse(CourseRef ref) {
@@ -1371,21 +2195,17 @@ public final class ChaoxingHook extends XposedModule {
         }
     }
 
-    @SuppressLint("ApplySharedPref")
     private void attachBridgeToken(Intent intent) {
         try {
             SharedPreferences prefs = getRemotePreferences(BridgeAuth.PREFS_NAME);
             String token = prefs.getString(BridgeAuth.KEY_TOKEN, "");
-            if (token == null || token.isEmpty()) {
-                token = BridgeAuth.newToken();
-                prefs.edit().putString(BridgeAuth.KEY_TOKEN, token).commit();
-            }
             if (token != null && !token.isEmpty()) {
                 intent.putExtra(BridgeAuth.EXTRA_TOKEN, token);
+            } else {
+                log(Log.WARN, TAG, "bridge token missing; open module app once to initialize bridge");
             }
         } catch (Throwable throwable) {
-            intent.putExtra(BridgeAuth.EXTRA_TOKEN, BridgeAuth.FALLBACK_TOKEN);
-            log(Log.WARN, TAG, "bridge token unavailable, using fallback token: " + throwable);
+            log(Log.WARN, TAG, "bridge token unavailable: " + throwable.getClass().getSimpleName());
         }
     }
 
@@ -1431,6 +2251,16 @@ public final class ChaoxingHook extends XposedModule {
         }
         for (DeadlineItem item : copy) {
             emit(item);
+        }
+    }
+
+    private static final class CourseScanResult {
+        final CourseRef ref;
+        final boolean foundDeadline;
+
+        CourseScanResult(CourseRef ref, boolean foundDeadline) {
+            this.ref = ref;
+            this.foundDeadline = foundDeadline;
         }
     }
 

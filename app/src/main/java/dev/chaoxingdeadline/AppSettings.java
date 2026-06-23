@@ -11,6 +11,9 @@ import java.util.concurrent.TimeUnit;
 public final class AppSettings {
     public static final String PREFS = "app_settings";
     public static final String LAUNCHER_ALIAS = "dev.chaoxingdeadline.LauncherActivity";
+    public static final int OVERLAY_WINDOW_ALL = -1;
+    private static final int DEFAULT_OVERLAY_WINDOW_HOURS = 24;
+    private static final int[] OVERLAY_WINDOW_OPTIONS = {3, 8, 12, 24, 72, OVERLAY_WINDOW_ALL};
 
     private AppSettings() {
     }
@@ -73,12 +76,51 @@ public final class AppSettings {
         syncRemotePreferences(context);
     }
 
+    public static int overlayWindowHours(Context context) {
+        int value = prefs(context).getInt("overlay_window_hours", DEFAULT_OVERLAY_WINDOW_HOURS);
+        return isOverlayWindowOption(value) ? value : DEFAULT_OVERLAY_WINDOW_HOURS;
+    }
+
+    public static void setOverlayWindowHours(Context context, int hours) {
+        int value = isOverlayWindowOption(hours) ? hours : DEFAULT_OVERLAY_WINDOW_HOURS;
+        prefs(context).edit().putInt("overlay_window_hours", value).apply();
+        syncRemotePreferences(context);
+    }
+
+    public static int[] overlayWindowOptions() {
+        return OVERLAY_WINDOW_OPTIONS.clone();
+    }
+
+    public static String overlayWindowLabel(Context context) {
+        return overlayWindowLabel(overlayWindowHours(context));
+    }
+
+    public static String overlayWindowLabel(int hours) {
+        if (hours == OVERLAY_WINDOW_ALL) {
+            return "所有未完成待办";
+        }
+        if (hours == 72) {
+            return "3天内待办";
+        }
+        return hours + "小时内待办";
+    }
+
+    private static boolean isOverlayWindowOption(int value) {
+        for (int option : OVERLAY_WINDOW_OPTIONS) {
+            if (option == value) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static void syncRemotePreferences(Context context) {
         try {
             if (App.getService() != null) {
                 App.getService().getRemotePreferences(PREFS)
                         .edit()
                         .putBoolean("overlay_enabled", overlayEnabled(context))
+                        .putInt("overlay_window_hours", overlayWindowHours(context))
                         .apply();
             }
         } catch (Throwable ignored) {

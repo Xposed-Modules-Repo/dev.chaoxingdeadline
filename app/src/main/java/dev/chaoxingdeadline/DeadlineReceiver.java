@@ -17,6 +17,10 @@ public final class DeadlineReceiver extends BroadcastReceiver {
     public static final String ACTION_IGNORE = "dev.chaoxingdeadline.IGNORE";
     public static final String ACTION_DELETE = "dev.chaoxingdeadline.DELETE";
     public static final String ACTION_COURSE = "dev.chaoxingdeadline.COURSE";
+    public static final String ACTION_COURSE_SCAN_RESULT = "dev.chaoxingdeadline.COURSE_SCAN_RESULT";
+    public static final String ACTION_COURSE_SCAN_BATCH = "dev.chaoxingdeadline.COURSE_SCAN_BATCH";
+    public static final String ACTION_COURSE_SCAN_PERF = "dev.chaoxingdeadline.COURSE_SCAN_PERF";
+    public static final String ACTION_SETTINGS_UPDATE = "dev.chaoxingdeadline.SETTINGS_UPDATE";
     public static final String EXTRA_ITEM_B64 = "item_b64";
     public static final String EXTRA_STATUS = "status";
     public static final String EXTRA_SOURCE = "source";
@@ -75,6 +79,42 @@ public final class DeadlineReceiver extends BroadcastReceiver {
                     intent.getStringExtra("uid"),
                     intent.getStringExtra("course"),
                     intent.getStringExtra("raw"));
+            OverlayBridge.publish(context);
+            context.sendBroadcast(new Intent(ACTION_REFRESH).setPackage(context.getPackageName()));
+            return;
+        }
+        if (ACTION_COURSE_SCAN_RESULT.equals(intent.getAction())) {
+            CourseScanScores.record(context,
+                    intent.getStringExtra("course_id"),
+                    intent.getStringExtra("class_id"),
+                    intent.getBooleanExtra("found_deadline", false));
+            return;
+        }
+        if (ACTION_COURSE_SCAN_BATCH.equals(intent.getAction())) {
+            CourseScanScores.recordBatch(context,
+                    intent.getStringArrayExtra("course_ids"),
+                    intent.getStringArrayExtra("class_ids"),
+                    intent.getStringArrayExtra("course_names"),
+                    intent.getBooleanArrayExtra("found_deadlines"));
+            return;
+        }
+        if (ACTION_COURSE_SCAN_PERF.equals(intent.getAction())) {
+            CourseScanThreads.record(context,
+                    intent.getIntExtra("threads", CourseScanThreads.DEFAULT),
+                    intent.getLongExtra("elapsed_ms", 0L),
+                    intent.getIntExtra("refs", 0),
+                    intent.getIntExtra("scheduled", 0),
+                    intent.getIntExtra("scanned", 0));
+            return;
+        }
+        if (ACTION_SETTINGS_UPDATE.equals(intent.getAction())) {
+            if (intent.hasExtra("overlay_enabled")) {
+                AppSettings.setOverlayEnabled(context, intent.getBooleanExtra("overlay_enabled", true));
+            }
+            if (intent.hasExtra("overlay_window_hours")) {
+                AppSettings.setOverlayWindowHours(context,
+                        intent.getIntExtra("overlay_window_hours", AppSettings.OVERLAY_WINDOW_ALL));
+            }
             OverlayBridge.publish(context);
             context.sendBroadcast(new Intent(ACTION_REFRESH).setPackage(context.getPackageName()));
             return;

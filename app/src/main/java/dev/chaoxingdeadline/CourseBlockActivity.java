@@ -39,7 +39,7 @@ public final class CourseBlockActivity extends BaseActivity {
         scroll.addView(content, new ScrollView.LayoutParams(-1, -2));
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
 
-        View clear = actionRow("↻", "清空手动屏蔽", "恢复所有课程的作业和考试显示");
+        View clear = actionRow("↻", "恢复所有课程查询", "恢复所有课程的作业和考试扫描");
         clear.setOnClickListener(v -> {
             store.clearBlockedCourses();
             OverlayBridge.publish(this);

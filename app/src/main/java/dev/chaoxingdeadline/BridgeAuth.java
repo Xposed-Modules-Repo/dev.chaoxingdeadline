@@ -11,7 +11,6 @@ public final class BridgeAuth {
     public static final String PREFS_NAME = "bridge_auth";
     public static final String KEY_TOKEN = "token";
     public static final String EXTRA_TOKEN = "bridge_token";
-    public static final String FALLBACK_TOKEN = "f1b3e7f7c7b24ac286cb9c18d6f1a826c444eb4d4e3d9f61f7c22b5e72c45119";
     private static final String TAG = "ChaoxingDeadline";
     private static final char[] HEX = "0123456789abcdef".toCharArray();
 
@@ -39,13 +38,26 @@ public final class BridgeAuth {
         intent.putExtra(EXTRA_TOKEN, ensureToken(context));
     }
 
+    public static void syncRemotePreferences(Context context) {
+        try {
+            if (App.getService() != null) {
+                App.getService().getRemotePreferences(PREFS_NAME)
+                        .edit()
+                        .putString(KEY_TOKEN, ensureToken(context))
+                        .apply();
+            }
+        } catch (Throwable throwable) {
+            Log.w(TAG, "Unable to sync bridge token: " + throwable.getClass().getSimpleName());
+        }
+    }
+
     public static boolean isValid(Context context, Intent intent) {
         if (intent == null) {
             return false;
         }
         String expected = ensureToken(context);
         String actual = intent.getStringExtra(EXTRA_TOKEN);
-        boolean valid = expected.equals(actual) || FALLBACK_TOKEN.equals(actual);
+        boolean valid = expected.equals(actual);
         if (!valid) {
             Log.w(TAG, "Rejected unauthenticated bridge broadcast: " + intent.getAction());
         }

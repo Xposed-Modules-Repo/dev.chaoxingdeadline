@@ -1,6 +1,7 @@
 package dev.chaoxingdeadline;
 
 import android.Manifest;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.Uri;
@@ -52,7 +53,9 @@ public final class SettingsActivity extends BaseActivity {
         group1.addView(switchRow("学习通内弹窗", "打开学习通时显示待办摘要", AppSettings.overlayEnabled(this),
                 (b, c) -> AppSettings.setOverlayEnabled(this, c)));
         group1.addView(divider());
-        group1.addView(switchRow("自动删除已截止待办", "截止时间已过的项目自动移除", AppSettings.autoDeleteExpired(this),
+        group1.addView(overlayWindowRow());
+        group1.addView(divider());
+        group1.addView(switchRow("自动删除已完成待办", "已提交或已截止的项目自动移除", AppSettings.autoDeleteExpired(this),
                 (b, c) -> AppSettings.setAutoDeleteExpired(this, c)));
         content.addView(group1, groupParams());
 
@@ -159,6 +162,36 @@ public final class SettingsActivity extends BaseActivity {
         DeadlineNotifier.rescheduleUpcomingOnly(this);
         OverlayBridge.publish(this);
         Toast.makeText(this, "操作成功", Toast.LENGTH_SHORT).show();
+    }
+
+    private View overlayWindowRow() {
+        View row = innerActionRow("弹窗范围", "当前显示" + AppSettings.overlayWindowLabel(this));
+        row.setOnClickListener(v -> showOverlayWindowDialog());
+        return row;
+    }
+
+    private void showOverlayWindowDialog() {
+        int[] values = AppSettings.overlayWindowOptions();
+        String[] labels = new String[values.length];
+        int current = AppSettings.overlayWindowHours(this);
+        int checked = 0;
+        for (int i = 0; i < values.length; i++) {
+            labels[i] = AppSettings.overlayWindowLabel(values[i]);
+            if (values[i] == current) {
+                checked = i;
+            }
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("弹窗范围")
+                .setSingleChoiceItems(labels, checked, (dialog, which) -> {
+                    AppSettings.setOverlayWindowHours(this, values[which]);
+                    OverlayBridge.publish(this);
+                    Toast.makeText(this, "操作成功", Toast.LENGTH_SHORT).show();
+                    dialog.dismiss();
+                    recreate();
+                })
+                .setNegativeButton("取消", null)
+                .show();
     }
 
     private String exactAlarmSubtitle() {
