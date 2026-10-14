@@ -1660,7 +1660,7 @@ public final class ChaoxingHook extends XposedModule {
             connection = (HttpURLConnection) new URL(url).openConnection();
             connection.setConnectTimeout(8000);
             connection.setReadTimeout(10000);
-            connection.setRequestProperty("User-Agent", "Dalvik/2.1.0 (Linux; U; Android 16; OnePlus 11) Language/zh_CN com.chaoxing.mobile/ChaoXingStudy_3_6.4_android_phone");
+            connection.setRequestProperty("User-Agent", "Dalvik/2.1.0 (Linux; U; Android 16) Language/zh_CN com.chaoxing.mobile/ChaoXingStudy_3_6.4_android_phone");
             connection.setRequestProperty("Accept", "application/json,text/plain,*/*");
             connection.setRequestProperty("Accept-Language", "zh_CN");
             connection.setRequestProperty("Connection", "Keep-Alive");
