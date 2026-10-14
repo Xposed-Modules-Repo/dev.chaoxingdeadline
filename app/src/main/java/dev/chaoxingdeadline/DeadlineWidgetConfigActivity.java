@@ -57,6 +57,10 @@ public final class DeadlineWidgetConfigActivity extends BaseActivity {
                 AppSettings.widgetWindowHours(this)));
         window.setOnClickListener(v -> showWindowDialog());
         group.addView(window);
+        group.addView(divider());
+        View courseFilter = innerActionRow("筛选课程", "当前：" + AppSettings.widgetCourseFilterLabel(this));
+        courseFilter.setOnClickListener(v -> showCourseFilterDialog());
+        group.addView(courseFilter);
         content.addView(group, groupParams());
 
         content.addView(sectionHeader("生效方式"));
@@ -74,6 +78,42 @@ public final class DeadlineWidgetConfigActivity extends BaseActivity {
         content.addView(done, groupParams());
 
         return root;
+    }
+
+    private void showCourseFilterDialog() {
+        java.util.List<DeadlineItem> items = new DeadlineStore(this).activeItems();
+        java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
+        for (DeadlineItem item : items) {
+            if (item.course != null && !item.course.isEmpty()) {
+                names.add(item.course);
+            }
+        }
+        java.util.List<String> sorted = new java.util.ArrayList<>(names);
+        java.util.Collections.sort(sorted);
+        String[] labels = new String[sorted.size() + 1];
+        labels[0] = "全部课程";
+        for (int i = 0; i < sorted.size(); i++) {
+            labels[i + 1] = sorted.get(i);
+        }
+        int checked = 0;
+        String current = AppSettings.widgetCourseFilter(this);
+        if (!current.isEmpty()) {
+            for (int i = 0; i < sorted.size(); i++) {
+                if (sorted.get(i).equals(current)) {
+                    checked = i + 1;
+                    break;
+                }
+            }
+        }
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("筛选课程")
+                .setSingleChoiceItems(labels, checked, (dialog, which) -> {
+                    AppSettings.setWidgetCourseFilter(this, which == 0 ? "" : sorted.get(which - 1));
+                    dialog.dismiss();
+                    recreate();
+                })
+                .setNegativeButton("取消", null)
+                .show();
     }
 
     private void showWindowDialog() {

@@ -8,6 +8,8 @@ import java.util.concurrent.TimeUnit;
 public final class DateText {
     private static final ThreadLocal<SimpleDateFormat> FORMAT =
             ThreadLocal.withInitial(() -> new SimpleDateFormat("MM-dd HH:mm", Locale.CHINA));
+    private static final ThreadLocal<SimpleDateFormat> CLOCK =
+            ThreadLocal.withInitial(() -> new SimpleDateFormat("HH:mm", Locale.CHINA));
 
     private DateText() {
     }
@@ -26,5 +28,10 @@ public final class DateText {
 
     public static String deadlineTime(long dueAt) {
         return FORMAT.get().format(new Date(dueAt));
+    }
+
+    /** Wall-clock time of day, for timetable rows. */
+    public static String clock(long millis) {
+        return CLOCK.get().format(new Date(millis));
     }
 }

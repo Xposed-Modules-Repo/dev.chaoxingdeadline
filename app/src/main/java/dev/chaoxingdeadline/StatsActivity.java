@@ -46,7 +46,7 @@ public final class StatsActivity extends BaseActivity {
         List<DeadlineItem> items = new DeadlineStore(this).activeItems();
         long now = System.currentTimeMillis();
 
-        int pending = 0, expired = 0, done = 0;
+        int pending = 0, expired = 0, done = 0, vanished = 0;
         int[] perDay = new int[7];
         Map<String, Integer> perCourse = new HashMap<>();
         for (DeadlineItem item : items) {
@@ -59,6 +59,11 @@ public final class StatsActivity extends BaseActivity {
             }
             if (item.dueAt <= now) {
                 expired++;
+                continue;
+            }
+            if (item.vanishedAt > 0L) {
+                // Probably revoked: counted separately, never as a pending deadline.
+                vanished++;
                 continue;
             }
             pending++;
@@ -82,6 +87,10 @@ public final class StatsActivity extends BaseActivity {
             // cleanup setting: submitted and expired rows are deleted, so they cannot be counted.
             summary.addView(mutedRow("已开启「自动删除已完成待办」：已提交和已截止的记录会被自动清理，"
                     + "上面这两项只统计尚未清理的部分。"));
+        }
+        if (vanished > 0) {
+            summary.addView(mutedRow("连续两次完整刷新均未出现的待办 " + vanished
+                    + " 项，已暂停提醒并标记「可能已撤销」，不计入未完成。"));
         }
         content.addView(summary, groupParams());
 
@@ -114,6 +123,33 @@ public final class StatsActivity extends BaseActivity {
             }
         }
         content.addView(courses, groupParams());
+
+        content.addView(sectionHeader("类型分布（未完成）"));
+        LinearLayout types = card();
+        int homework = 0, exam = 0, chapter = 0, activity = 0;
+        for (DeadlineItem item : items) {
+            if (item == null || item.submitted || item.dueAt <= now) {
+                continue;
+            }
+            if ("\u4f5c\u4e1a".equals(item.type)) {
+                homework++;
+            } else if ("\u8003\u8bd5".equals(item.type)) {
+                exam++;
+            } else if ("\u7ae0\u8282".equals(item.type)) {
+                chapter++;
+            } else if ("\u8bfe\u5802\u6d3b\u52a8".equals(item.type)) {
+                activity++;
+            }
+        }
+        if (homework + exam + chapter + activity == 0) {
+            types.addView(mutedRow("暂无未完成待办。"));
+        } else {
+            if (homework > 0) types.addView(statLine("作业", homework + " 项", UiTheme.badgeHomework(this)));
+            if (exam > 0) types.addView(statLine("考试", exam + " 项", UiTheme.badgeExam(this)));
+            if (chapter > 0) types.addView(statLine("章节任务", chapter + " 项", UiTheme.badgeChapter(this)));
+            if (activity > 0) types.addView(statLine("课堂活动", activity + " 项", UiTheme.badgeActivity(this)));
+        }
+        content.addView(types, groupParams());
         return root;
     }
 

@@ -63,6 +63,10 @@ public final class UiTheme {
         return dark(context) ? Color.rgb(68, 35, 42) : Color.rgb(255, 238, 240);
     }
 
+    public static int dangerText(Context context) {
+        return dark(context) ? Color.rgb(248, 113, 113) : Color.rgb(194, 65, 72);
+    }
+
 
     // -- badge colors --
     public static int badgeHomework(Context context) {
@@ -87,6 +91,14 @@ public final class UiTheme {
 
     public static int badgeChapterBg(Context context) {
         return dark(context) ? Color.argb(35, 79, 209, 197) : Color.argb(20, 14, 159, 142);
+    }
+
+    public static int badgeActivity(Context context) {
+        return dark(context) ? Color.rgb(167, 139, 250) : Color.rgb(124, 58, 237);
+    }
+
+    public static int badgeActivityBg(Context context) {
+        return dark(context) ? Color.argb(35, 167, 139, 250) : Color.argb(20, 124, 58, 237);
     }
 
     // -- drawable builders --

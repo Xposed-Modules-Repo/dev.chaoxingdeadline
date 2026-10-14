@@ -6,8 +6,10 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.View;
+import android.widget.CompoundButton;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -56,7 +58,7 @@ public final class BackupActivity extends BaseActivity {
         note.setPadding(dp(16), dp(14), dp(16), dp(14));
         TextView body = text("模块没有联网权限，也不会把数据上传到任何地方。"
                 + "备份文件由你自己选择保存位置：\n"
-                + "· JSON 用于换机或重装后恢复本模块的待办；\n"
+                + "· JSON 用于换机或重装后恢复本模块的待办与设置；\n"
                 + "· ICS 可直接导入系统日历／小米日历，改用日历提醒。",
                 12, false, UiTheme.muted(this));
         body.setLineSpacing(0f, 1.25f);
@@ -95,9 +97,39 @@ public final class BackupActivity extends BaseActivity {
             }
         });
         importGroup.addView(restore);
+        importGroup.addView(divider());
+        importGroup.addView(switchRow("同时恢复设置", "提醒档位、免打扰、课程屏蔽等一并覆盖；关闭则只恢复待办",
+                AppSettings.backupRestoreSettings(this),
+                (b, c) -> AppSettings.setBackupRestoreSettings(this, c)));
         content.addView(importGroup, groupParams());
 
         return root;
+    }
+
+    private View switchRow(String title, String subtitle, boolean checked,
+                           CompoundButton.OnCheckedChangeListener listener) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(16), dp(13), dp(14), dp(13));
+        row.setMinimumHeight(dp(68));
+
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        texts.setGravity(Gravity.CENTER_VERTICAL);
+        texts.addView(text(title, 15, true, UiTheme.text(this)), new LinearLayout.LayoutParams(-1, -2));
+        if (subtitle != null && !subtitle.isEmpty()) {
+            TextView sub = text(subtitle, 12, false, UiTheme.muted(this));
+            sub.setPadding(0, dp(2), 0, 0);
+            texts.addView(sub, new LinearLayout.LayoutParams(-1, -2));
+        }
+        row.addView(texts, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        Switch toggle = new Switch(this);
+        toggle.setText("");
+        toggle.setChecked(checked);
+        toggle.setOnCheckedChangeListener(listener);
+        row.addView(toggle, new LinearLayout.LayoutParams(-2, -2));
+        return row;
     }
 
     private void createDocument(String mimeType, int requestCode) {
@@ -177,12 +209,15 @@ public final class BackupActivity extends BaseActivity {
                 }
                 payload = readAll(stream);
             }
-            int restored = DeadlineBackup.importJson(this, payload, false);
+            int restored = DeadlineBackup.importJson(this, payload, false,
+                    AppSettings.backupRestoreSettings(this));
             if (restored < 0) {
                 Toast.makeText(this, "不是有效的备份文件", Toast.LENGTH_SHORT).show();
                 return;
             }
-            Toast.makeText(this, "已恢复 " + restored + " 条待办", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, AppSettings.backupRestoreSettings(this)
+                    ? "已恢复 " + restored + " 条待办与设置"
+                    : "已恢复 " + restored + " 条待办", Toast.LENGTH_SHORT).show();
             reload();
         } catch (Throwable throwable) {
             Toast.makeText(this, "导入失败", Toast.LENGTH_SHORT).show();

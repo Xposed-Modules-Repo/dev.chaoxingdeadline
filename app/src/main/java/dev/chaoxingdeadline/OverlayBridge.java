@@ -38,7 +38,7 @@ public final class OverlayBridge {
             JSONArray array = new JSONArray();
             JSONArray suppressed = new JSONArray();
             for (DeadlineItem item : items) {
-                if (item.dueAt <= now || item.submitted) {
+                if (item.dueAt <= now || item.submitted || item.vanishedAt > 0L) {
                     suppressed.put(identityJson(item));
                     continue;
                 }

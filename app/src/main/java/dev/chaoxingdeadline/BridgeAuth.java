@@ -17,14 +17,18 @@ public final class BridgeAuth {
     private BridgeAuth() {
     }
 
-    public static String ensureToken(Context context) {
+    public static synchronized String ensureToken(Context context) {
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         String token = prefs.getString(KEY_TOKEN, "");
         if (token != null && token.length() >= 32) {
             return token;
         }
         token = newToken();
-        prefs.edit().putString(KEY_TOKEN, token).apply();
+        // commit(), not apply(): the token must be on disk before the next ensureToken()
+        // call can observe it. With apply() a burst of attach()/isValid() calls could each
+        // mint a different token and only the last write would survive, so an earlier
+        // broadcast carried a stale token and failed validation.
+        prefs.edit().putString(KEY_TOKEN, token).commit();
         return token;
     }
 

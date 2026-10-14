@@ -46,7 +46,7 @@ public final class ManualDeadlineDialog {
         Spinner type = new Spinner(context);
         type.setAdapter(new ArrayAdapter<>(context,
                 android.R.layout.simple_spinner_dropdown_item,
-                new String[]{"\u4f5c\u4e1a", "\u8003\u8bd5", "\u7ae0\u8282"}));
+                new String[]{"\u4f5c\u4e1a", "\u8003\u8bd5", "\u7ae0\u8282", "\u8bfe\u5802\u6d3b\u52a8"}));
         form.addView(labeled(context, "类型", type));
 
         List<String> courseChoices = new ArrayList<>();

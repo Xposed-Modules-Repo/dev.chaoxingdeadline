@@ -26,6 +26,10 @@ public final class DeadlineItem {
     public long dueAt;
     public boolean submitted;
     public int submissionState = SUBMISSION_UNKNOWN;
+    /** Consecutive authoritative scans that did not re-report this item. */
+    public int misses;
+    /** When the item was flagged as probably revoked/cancelled; 0 = not flagged. */
+    public long vanishedAt;
     public String source;
     public String url;
     public String raw;
@@ -47,6 +51,8 @@ public final class DeadlineItem {
                 ? SUBMISSION_SUBMITTED : submissionState;
         values.put("submitted", submitted ? 1 : 0);
         values.put("submit_state", storedSubmissionState);
+        values.put("misses", misses);
+        values.put("vanished_at", vanishedAt);
         values.put("source", source);
         values.put("url", url);
         values.put("updated_at", System.currentTimeMillis());
@@ -69,6 +75,8 @@ public final class DeadlineItem {
         json.put("dueAt", dueAt);
         json.put("submitted", submitted);
         json.put("submitState", submissionState);
+        json.put("misses", misses);
+        json.put("vanishedAt", vanishedAt);
         json.put("source", source);
         json.put("url", url);
         json.put("raw", raw);
@@ -89,6 +97,8 @@ public final class DeadlineItem {
         item.taskId = json.optString("taskId", "");
         item.courseConfidence = json.optInt("courseConfidence", item.course == null || item.course.isEmpty() ? 0 : 60);
         item.dueAt = json.optLong("dueAt", 0L);
+        item.misses = json.optInt("misses", 0);
+        item.vanishedAt = json.optLong("vanishedAt", 0L);
         if (json.has("submitState")) {
             item.setSubmissionState(json.optInt("submitState", SUBMISSION_UNKNOWN));
         } else if (json.optBoolean("submitted", false)) {
@@ -116,6 +126,8 @@ public final class DeadlineItem {
         item.submitted = cursor.getInt(cursor.getColumnIndexOrThrow("submitted")) != 0;
         item.setSubmissionState(intOrDefault(cursor, "submit_state",
                 item.submitted ? SUBMISSION_SUBMITTED : SUBMISSION_UNKNOWN));
+        item.misses = intOrDefault(cursor, "misses", 0);
+        item.vanishedAt = longOrDefault(cursor, "vanished_at", 0L);
         item.source = stringOrEmpty(cursor, "source");
         item.url = stringOrEmpty(cursor, "url");
         item.raw = stringOrEmpty(cursor, "raw");
@@ -159,6 +171,11 @@ public final class DeadlineItem {
 
     private static int intOrZero(Cursor cursor, String column) {
         return intOrDefault(cursor, column, 0);
+    }
+
+    private static long longOrDefault(Cursor cursor, String column, long fallback) {
+        int index = cursor.getColumnIndex(column);
+        return index < 0 ? fallback : cursor.getLong(index);
     }
 
     private static int intOrDefault(Cursor cursor, String column, int fallback) {

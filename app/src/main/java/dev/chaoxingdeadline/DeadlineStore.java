@@ -8,6 +8,7 @@ import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -17,18 +18,30 @@ import java.util.Set;
 
 public final class DeadlineStore extends SQLiteOpenHelper {
     private static final String DB_NAME = "deadlines.db";
-    private static final int DB_VERSION = 5;
-    private static final String PREFS = "blocked_courses";
+    private static final int DB_VERSION = 9;
+    public static final String PREFS = "blocked_courses";
+    private static final String SCHEDULE_PREFS = "schedule_meta";
+    private static final String KEY_FIRST_WEEK_DATE = "first_week_date";
+    private static final String KEY_SECTION_TIMES = "section_times";
+    private static final String KEY_SCHEDULE_UPDATED_AT = "updated_at";
     private static final String KEY_LEGACY_COURSES = "courses";
     private static final String KEY_BLOCKED_RULES = "rules";
     private static final String TYPE_ALL = "\u5168\u90e8";
     private static final String TYPE_HOMEWORK = "\u4f5c\u4e1a";
     private static final String TYPE_EXAM = "\u8003\u8bd5";
     private static final String TYPE_CHAPTER = "\u7ae0\u8282";
+    private static final String TYPE_ACTIVITY = "\u8bfe\u5802\u6d3b\u52a8";
+    /** Rows past their deadline by this much are housekeeping-deleted on upsert. */
+    private static final long EXPIRED_RETENTION_MS = 90L * 24L * 60L * 60L * 1000L;
     // courses table lookups happen on every activeItems()/widget refresh; cache the
     // (small) course-name mapping to avoid the N+1 query pattern.
     private static final Map<String, String> COURSE_NAME_CACHE =
             Collections.synchronizedMap(new HashMap<>());
+    // Blocked-course rules are read once per item on the hottest read paths (5s UI poll,
+    // every broadcast, every widget refresh); keep them in memory and refresh on write.
+    // Only this process ever writes these prefs, so a static cache cannot go stale.
+    private static volatile Set<String> legacyCoursesCache;
+    private static volatile Set<String> blockedRulesCache;
     private final Context context;
 
     public DeadlineStore(Context context) {
@@ -52,6 +65,8 @@ public final class DeadlineStore extends SQLiteOpenHelper {
                 + "due_at INTEGER NOT NULL,"
                 + "submitted INTEGER NOT NULL DEFAULT 0,"
                 + "submit_state INTEGER NOT NULL DEFAULT -1,"
+                + "misses INTEGER NOT NULL DEFAULT 0,"
+                + "vanished_at INTEGER NOT NULL DEFAULT 0,"
                 + "source TEXT,"
                 + "url TEXT,"
                 + "updated_at INTEGER NOT NULL,"
@@ -61,6 +76,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         db.execSQL("CREATE INDEX idx_deadlines_task_ref ON deadlines(type, course_id, class_id, task_id)");
         createCourseTable(db);
         createIgnoredTable(db);
+        createLessonsTable(db);
     }
 
     @Override
@@ -89,6 +105,50 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         }
         if (oldVersion < 5) {
             createIgnoredTable(db);
+        }
+        if (oldVersion < 6) {
+            // 1.9.0: taskactivelist payloads used to be typed 作业, which both duplicated
+            // the real homework rows and buried classroom activities in the wrong section.
+            // Re-type the rows that were captured from that endpoint; the next capture of
+            // the same task replaces them via the task-identity dedup in upsert().
+            retypeActivityRows(db);
+        }
+        if (oldVersion < 7) {
+            // 1.10.0: revoked-deadline detection state.
+            addColumn(db, "deadlines", "misses", "INTEGER NOT NULL DEFAULT 0");
+            addColumn(db, "deadlines", "vanished_at", "INTEGER NOT NULL DEFAULT 0");
+        }
+        if (oldVersion < 8) {
+            // 1.11.0: weekly timetable (课程表) captured from Chaoxing.
+            createLessonsTable(db);
+        }
+        if (oldVersion < 9) {
+            // 1.11.1: sweep duplicate rows written by versions whose deletes could not
+            // match across the legacy/real course-id spaces. Runs once, in the upgrade
+            // transaction, so existing duplicates heal themselves on install.
+            repairDuplicates(db, true);
+        }
+    }
+
+    private void createLessonsTable(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS lessons ("
+                + "id TEXT PRIMARY KEY,"
+                + "name TEXT NOT NULL DEFAULT '',"
+                + "teacher TEXT,"
+                + "location TEXT,"
+                + "day_of_week INTEGER NOT NULL DEFAULT 0,"
+                + "begin_section INTEGER NOT NULL DEFAULT 0,"
+                + "sections INTEGER NOT NULL DEFAULT 1,"
+                + "weeks TEXT,"
+                + "updated_at INTEGER NOT NULL)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_lessons_day ON lessons(day_of_week, begin_section)");
+    }
+
+    void retypeActivityRows(SQLiteDatabase db) {
+        try {
+            db.execSQL("UPDATE deadlines SET type = '" + TYPE_ACTIVITY
+                    + "' WHERE type = '" + TYPE_HOMEWORK + "' AND source LIKE 'active.taskList%'");
+        } catch (Throwable ignored) {
         }
     }
 
@@ -196,16 +256,55 @@ public final class DeadlineStore extends SQLiteOpenHelper {
                     db.replace("deadlines", null, item.toValues());
                 }
             } else {
-                preserveSubmissionState(db, item);
+                // Converge capture channels on ONE row. A passive capture carries no task
+                // id and often a name-derived "legacy:hash" course id; adopting the richer
+                // identity of the row it duplicates keeps every channel writing the same
+                // row instead of ping-ponging between two ids — which is how duplicates
+                // survived the 1.9.x fixes (the deletes below could not match across the
+                // id spaces).
+                DeadlineItem twin = findTwin(db, item);
+                if (twin != null) {
+                    if (empty(item.taskId)) {
+                        item.taskId = twin.taskId;
+                    }
+                    if (empty(item.courseId)) {
+                        item.courseId = twin.courseId;
+                    }
+                    if (empty(item.classId)) {
+                        item.classId = twin.classId;
+                    }
+                    if (empty(item.course)) {
+                        item.course = twin.course;
+                    }
+                    item.id = twin.id;
+                    preserveSubmissionState(db, item);
+                } else {
+                    preserveSubmissionState(db, item);
+                }
                 db.replace("deadlines", null, item.toValues());
                 deleteLikelyDuplicates(db, item);
             }
             if (AppSettings.autoDeleteExpired(context)) {
                 prune();
             }
+            pruneExpiredBeyondRetention(db);
             db.setTransactionSuccessful();
         } finally {
             db.endTransaction();
+        }
+    }
+
+    /**
+     * Housekeeping: drop rows whose deadline passed more than EXPIRED_RETENTION_MS ago.
+     * Without this the table kept every expired row (raw JSON included) forever whenever
+     * auto-delete was off; recent expired items still show in the list, only ancient
+     * history is reclaimed. due_at is indexed, so this is a cheap range delete.
+     */
+    private void pruneExpiredBeyondRetention(SQLiteDatabase db) {
+        try {
+            long cutoff = System.currentTimeMillis() - EXPIRED_RETENTION_MS;
+            db.delete("deadlines", "due_at < ?", new String[]{String.valueOf(cutoff)});
+        } catch (Throwable ignored) {
         }
     }
 
@@ -392,9 +491,20 @@ public final class DeadlineStore extends SQLiteOpenHelper {
             return true;
         }
         if (!empty(item.taskId) && !empty(item.courseId)) {
-            return hasIgnoredMatch(db,
+            if (hasIgnoredMatch(db,
                     "type = ? AND course_id = ? AND class_id = ? AND task_id = ?",
-                    new String[]{safe(item.type), safe(item.courseId), safe(item.classId), safe(item.taskId)});
+                    new String[]{safe(item.type), safe(item.courseId), safe(item.classId), safe(item.taskId)})) {
+                return true;
+            }
+            // 1.9.0 re-typed taskactivelist rows from 作业 to 课堂活动; an ignore rule
+            // recorded under the old type must still suppress the very same task. The
+            // title cross-check keeps unrelated tasks that merely share an id namespace
+            // (activity ids and work ids are numbered independently) from being suppressed.
+            if (hasIgnoredMatch(db,
+                    "course_id = ? AND class_id = ? AND task_id = ? AND title = ?",
+                    new String[]{safe(item.courseId), safe(item.classId), safe(item.taskId), item.title})) {
+                return true;
+            }
         }
         long window = TYPE_HOMEWORK.equals(item.type) ? 6L * 60L * 60L * 1000L : 30L * 60L * 1000L;
         if (empty(item.title)) {
@@ -445,30 +555,200 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         }
     }
 
+    /**
+     * The captured row a fresh capture duplicates: same type, same title, deadline within
+     * the merge window, and a compatible course (same name, or either side unnamed — a
+     * passive capture often has no course name at all). Prefers rows carrying a task id,
+     * so the richer identity wins the merge.
+     */
+    private DeadlineItem findTwin(SQLiteDatabase db, DeadlineItem item) {
+        if (item.type == null || item.title == null || item.id == null) {
+            return null;
+        }
+        long window = mergeWindow(item.type);
+        String course = item.course == null ? "" : item.course;
+        String courseId = item.courseId == null ? "" : item.courseId;
+        String classId = item.classId == null ? "" : item.classId;
+        String where = "id <> ? AND (source IS NULL OR source != 'manual') AND type = ? AND title = ? "
+                + "AND ABS(due_at - ?) <= ? "
+                + "AND (course = ? OR course = '' OR course IS NULL OR ? = '') "
+                + "AND (course_id = ? OR course_id = '' OR course_id IS NULL OR ? = '' "
+                + "OR course_id LIKE 'legacy:%' OR ? LIKE 'legacy:%') "
+                + "AND (class_id = ? OR class_id = '' OR class_id IS NULL OR ? = '' "
+                + "OR class_id LIKE 'legacy:%' OR ? LIKE 'legacy:%')";
+        String[] args = {item.id, item.type, item.title,
+                String.valueOf(item.dueAt), String.valueOf(window), course, course,
+                courseId, courseId, courseId, classId, classId, classId};
+        try (Cursor cursor = db.query("deadlines", null, where, args, null, null,
+                "CASE WHEN task_id IS NULL OR task_id = '' THEN 1 ELSE 0 END ASC, "
+                        + "ABS(due_at - " + item.dueAt + ") ASC", "1")) {
+            return cursor.moveToFirst() ? DeadlineItem.fromCursor(cursor) : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static long mergeWindow(String type) {
+        return TYPE_HOMEWORK.equals(type) ? 6L * 60L * 60L * 1000L : 30L * 60L * 1000L;
+    }
+
     private void deleteLikelyDuplicates(SQLiteDatabase db, DeadlineItem item) {
         if (item.type == null || item.title == null || item.id == null) {
             return;
         }
+        long window = mergeWindow(item.type);
+        String course = item.course == null ? "" : item.course;
+        String courseId = item.courseId == null ? "" : item.courseId;
+        String classId = item.classId == null ? "" : item.classId;
+        // 1) Exact task identity — the strongest signal, unchanged.
         if (!empty(item.taskId) && !empty(item.courseId)) {
             db.delete("deadlines",
                     "id <> ? AND type = ? AND course_id = ? AND class_id = ? AND task_id = ?",
-                    new String[]{item.id, item.type, item.courseId, item.classId == null ? "" : item.classId, item.taskId});
-            return;
+                    new String[]{item.id, item.type, courseId, classId, item.taskId});
         }
-        long window = TYPE_HOMEWORK.equals(item.type) ? 6L * 60L * 60L * 1000L : 30L * 60L * 1000L;
-        if (!empty(item.courseId) || !empty(item.classId)) {
-            db.delete(
-                    "deadlines",
-                    "id <> ? AND type = ? AND course_id = ? AND class_id = ? AND title = ? AND ABS(due_at - ?) <= ?",
-                    new String[]{item.id, item.type, item.courseId == null ? "" : item.courseId,
-                            item.classId == null ? "" : item.classId, item.title,
-                            String.valueOf(item.dueAt), String.valueOf(window)});
-            return;
+        // 2) Same course + same title + close due. The course is matched by NAME with a
+        //    course-id guard: the same task arrives with a real id from the active scan
+        //    and a name-derived "legacy:hash" id from a passive capture, and those two
+        //    must still merge, while two genuinely different courses that happen to
+        //    share a homework title must not. A derived or missing id therefore falls
+        //    back to the name, an authoritative one on both sides has to be equal.
+        db.delete("deadlines",
+                "id <> ? AND type = ? AND title = ? AND ABS(due_at - ?) <= ? "
+                        + "AND (course = ? OR course = '' OR course IS NULL OR ? = '') "
+                        + "AND (course_id = ? OR course_id = '' OR course_id IS NULL OR ? = '' "
+                        + "OR course_id LIKE 'legacy:%' OR ? LIKE 'legacy:%') "
+                        + "AND (class_id = ? OR class_id = '' OR class_id IS NULL OR ? = '' "
+                        + "OR class_id LIKE 'legacy:%' OR ? LIKE 'legacy:%')",
+                new String[]{item.id, item.type, item.title,
+                        String.valueOf(item.dueAt), String.valueOf(window), course, course,
+                        courseId, courseId, courseId, classId, classId, classId});
+    }
+
+    // -- duplicate repair (for rows written by older versions) --
+
+    /** How many rows {@link #repairDuplicates()} would remove right now. */
+    public int countDuplicates() {
+        return repairDuplicates(getReadableDatabase(), false);
+    }
+
+    /**
+     * Merge rows that are already duplicates in the table: same type, same title,
+     * deadline within the merge window and a compatible course. Keeps the row with the
+     * richest identity (task id, then course refs), absorbs the rest into it, and drops
+     * them. Manual entries are never touched. Repairs databases written by versions
+     * whose deletes could not match across the legacy/real course-id spaces.
+     */
+    public int repairDuplicates() {
+        return repairDuplicates(getWritableDatabase(), true);
+    }
+
+    /** @param apply false to only measure the damage (used by {@link #countDuplicates()}). */
+    private int repairDuplicates(SQLiteDatabase db, boolean apply) {
+        List<DeadlineItem> rows = allRows(db);
+        ArrayList<DeadlineItem> keepers = new ArrayList<>();
+        ArrayList<String> removeIds = new ArrayList<>();
+        ArrayList<DeadlineItem> updates = new ArrayList<>();
+        for (DeadlineItem row : rows) {
+            if (row == null || row.id == null || row.id.isEmpty()
+                    || "manual".equals(row.source) || row.title == null || row.title.isEmpty()) {
+                continue;
+            }
+            DeadlineItem keeper = null;
+            for (DeadlineItem candidate : keepers) {
+                if (isSameTask(candidate, row)) {
+                    keeper = candidate;
+                    break;
+                }
+            }
+            if (keeper == null) {
+                keepers.add(row);
+                continue;
+            }
+            mergeInto(keeper, row);
+            removeIds.add(row.id);
+            updates.add(keeper);
         }
-        db.delete(
-                "deadlines",
-                "id <> ? AND type = ? AND title = ? AND ABS(due_at - ?) <= ?",
-                new String[]{item.id, item.type, item.title, String.valueOf(item.dueAt), String.valueOf(window)});
+        if (removeIds.isEmpty() || !apply) {
+            return removeIds.size();
+        }
+        db.beginTransaction();
+        try {
+            for (DeadlineItem keeper : updates) {
+                db.update("deadlines", keeper.toValues(), "id = ?", new String[]{keeper.id});
+            }
+            for (String id : removeIds) {
+                db.delete("deadlines", "id = ?", new String[]{id});
+            }
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+        return removeIds.size();
+    }
+
+    private static boolean isSameTask(DeadlineItem a, DeadlineItem b) {
+        if (a == null || b == null || a.type == null || b.type == null || a.title == null || b.title == null) {
+            return false;
+        }
+        if (!a.type.equals(b.type) || !a.title.equals(b.title)) {
+            return false;
+        }
+        if (Math.abs(a.dueAt - b.dueAt) > mergeWindow(a.type)) {
+            return false;
+        }
+        String courseA = a.course == null ? "" : a.course;
+        String courseB = b.course == null ? "" : b.course;
+        if (!courseA.isEmpty() && !courseB.isEmpty() && !courseA.equals(courseB)) {
+            return false;
+        }
+        // Same shape as the SQL guard in upsert: an authoritative course id on both
+        // sides has to match, a derived "legacy:hash" one falls back to the name.
+        return !refConflicts(a.courseId, b.courseId) && !refConflicts(a.classId, b.classId);
+    }
+
+    private static boolean refConflicts(String left, String right) {
+        String a = left == null ? "" : left.trim();
+        String b = right == null ? "" : right.trim();
+        boolean realA = !a.isEmpty() && !a.startsWith("legacy:");
+        boolean realB = !b.isEmpty() && !b.startsWith("legacy:");
+        return realA && realB && !a.equals(b);
+    }
+
+    /** Absorb {@code row} into {@code keeper}: fill gaps, prefer submitted, keep earliest. */
+    private static void mergeInto(DeadlineItem keeper, DeadlineItem row) {
+        if (empty(keeper.taskId)) {
+            keeper.taskId = row.taskId;
+        }
+        if (empty(keeper.courseId)) {
+            keeper.courseId = row.courseId;
+        }
+        if (empty(keeper.classId)) {
+            keeper.classId = row.classId;
+        }
+        if (empty(keeper.course)) {
+            keeper.course = row.course;
+        }
+        if (empty(keeper.url)) {
+            keeper.url = row.url;
+        }
+        if (row.submitted) {
+            keeper.submitted = true;
+            if (keeper.submissionState == DeadlineItem.SUBMISSION_UNKNOWN) {
+                keeper.submissionState = row.submissionState;
+            }
+        }
+        keeper.courseConfidence = Math.max(keeper.courseConfidence, row.courseConfidence);
+    }
+
+    private List<DeadlineItem> allRows(SQLiteDatabase db) {
+        ArrayList<DeadlineItem> items = new ArrayList<>();
+        try (Cursor cursor = db.query("deadlines", null, null, null, null, null, "due_at ASC")) {
+            while (cursor.moveToNext()) {
+                items.add(DeadlineItem.fromCursor(cursor));
+            }
+        } catch (Throwable ignored) {
+        }
+        return items;
     }
 
     public List<DeadlineItem> activeItems() {
@@ -496,14 +776,112 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         return items;
     }
 
-    /** Homework, exam and chapter task points are the types this module tracks. */
+    /** Homework, exam, chapter task points and classroom activities are the types this module tracks. */
     public static boolean isSupportedType(String type) {
-        return TYPE_HOMEWORK.equals(type) || TYPE_EXAM.equals(type) || TYPE_CHAPTER.equals(type);
+        return TYPE_HOMEWORK.equals(type) || TYPE_EXAM.equals(type) || TYPE_CHAPTER.equals(type)
+                || TYPE_ACTIVITY.equals(type);
     }
 
     /** Types offered in the per-course management screen, in display order. */
     public static String[] managedTypes() {
-        return new String[]{TYPE_HOMEWORK, TYPE_EXAM, TYPE_CHAPTER};
+        return new String[]{TYPE_HOMEWORK, TYPE_EXAM, TYPE_CHAPTER, TYPE_ACTIVITY};
+    }
+
+    /**
+     * Consecutive authoritative scans an item may miss before it is flagged as probably
+     * revoked. Two rounds, never one: an item passively captured after the round snapshot,
+     * or a teacher who merely moved the deadline, must not trip this.
+     */
+    private static final int VANISH_MISSES = 2;
+
+    /**
+     * Fold one completed scan round into the store.
+     *
+     * The hook reports which courses it actually fetched successfully plus every item id
+     * it saw during the round. An item is only judged when its own course was
+     * authoritatively scanned; manual entries, chapter task points (passive-only, never
+     * actively fetched) and terminal rows are never touched. Returns the number of rows
+     * newly flagged as probably revoked.
+     */
+    public int applyScanRound(String[] courseKeys, String[] seenIds) {
+        if (courseKeys == null || courseKeys.length == 0 || seenIds == null) {
+            return 0;
+        }
+        Set<String> scanned = new HashSet<>(Arrays.asList(courseKeys));
+        Set<String> seen = new HashSet<>(Arrays.asList(seenIds));
+        boolean autoRemove = AppSettings.autoRemoveVanished(context);
+        long now = System.currentTimeMillis();
+        ArrayList<DeadlineItem> updates = new ArrayList<>();
+        ArrayList<String> deleteIds = new ArrayList<>();
+        int flagged = 0;
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            try (Cursor cursor = db.query("deadlines", null, null, null, null, null, null)) {
+                while (cursor.moveToNext()) {
+                    DeadlineItem item = DeadlineItem.fromCursor(cursor);
+                    if (item.submitted || item.dueAt <= now) {
+                        continue;
+                    }
+                    if ("manual".equals(item.source) || !isVanishableType(item.type)) {
+                        continue;
+                    }
+                    if (empty(item.courseId)
+                            || !scanned.contains(safe(item.courseId) + "|" + safe(item.classId))) {
+                        continue;
+                    }
+                    if (seen.contains(item.id)) {
+                        if (item.misses != 0 || item.vanishedAt > 0L) {
+                            item.misses = 0;
+                            item.vanishedAt = 0L;
+                            updates.add(item);
+                        }
+                        continue;
+                    }
+                    item.misses = item.misses + 1;
+                    if (item.misses >= VANISH_MISSES) {
+                        if (item.vanishedAt <= 0L) {
+                            item.vanishedAt = now;
+                            flagged++;
+                        }
+                        if (autoRemove) {
+                            deleteIds.add(item.id);
+                            continue;
+                        }
+                    }
+                    updates.add(item);
+                }
+            }
+            for (DeadlineItem item : updates) {
+                ContentValues values = new ContentValues();
+                values.put("misses", item.misses);
+                values.put("vanished_at", item.vanishedAt);
+                db.update("deadlines", values, "id = ?", new String[]{item.id});
+            }
+            for (String id : deleteIds) {
+                db.delete("deadlines", "id = ?", new String[]{id});
+            }
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+        return flagged;
+    }
+
+    /** User says "still valid": clear the flag and the miss counter. */
+    public void clearVanished(String id) {
+        if (id == null || id.isEmpty()) {
+            return;
+        }
+        ContentValues values = new ContentValues();
+        values.put("misses", 0);
+        values.put("vanished_at", 0L);
+        getWritableDatabase().update("deadlines", values, "id = ?", new String[]{id});
+    }
+
+    /** Only the types the active scan endpoints actually report can be judged missing. */
+    private static boolean isVanishableType(String type) {
+        return TYPE_HOMEWORK.equals(type) || TYPE_EXAM.equals(type) || TYPE_ACTIVITY.equals(type);
     }
 
     /** Marks an item done (or undone) by hand; the hook still overwrites it on next capture. */
@@ -518,6 +896,103 @@ public final class DeadlineStore extends SQLiteOpenHelper {
                 ? DeadlineItem.SUBMISSION_SUBMITTED : DeadlineItem.SUBMISSION_UNSUBMITTED);
         values.put("updated_at", System.currentTimeMillis());
         db.update("deadlines", values, "id = ?", new String[]{id});
+    }
+
+    // -- weekly timetable (课程表) --
+
+    /** Replace the whole timetable with the latest capture. */
+    public void replaceLessons(List<Lesson> lessons, long firstWeekDate, String sectionTimesJson) {
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            db.delete("lessons", null, null);
+            long now = System.currentTimeMillis();
+            if (lessons != null) {
+                for (Lesson lesson : lessons) {
+                    if (lesson == null || lesson.name == null || lesson.name.isEmpty()
+                            || lesson.dayOfWeek <= 0 || lesson.beginSection <= 0) {
+                        continue;
+                    }
+                    ContentValues values = new ContentValues();
+                    values.put("id", lesson.id == null || lesson.id.isEmpty()
+                            ? lesson.stableId() : lesson.id);
+                    values.put("name", lesson.name);
+                    values.put("teacher", lesson.teacher);
+                    values.put("location", lesson.location);
+                    values.put("day_of_week", lesson.dayOfWeek);
+                    values.put("begin_section", lesson.beginSection);
+                    values.put("sections", lesson.sections <= 0 ? 1 : lesson.sections);
+                    values.put("weeks", lesson.weeks);
+                    values.put("updated_at", now);
+                    db.replace("lessons", null, values);
+                }
+            }
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+        SharedPreferences.Editor editor = schedulePrefs().edit();
+        if (firstWeekDate > 0L) {
+            editor.putLong(KEY_FIRST_WEEK_DATE, firstWeekDate);
+        }
+        if (sectionTimesJson != null && !sectionTimesJson.isEmpty()) {
+            editor.putString(KEY_SECTION_TIMES, sectionTimesJson);
+        }
+        editor.putLong(KEY_SCHEDULE_UPDATED_AT, System.currentTimeMillis());
+        editor.apply();
+    }
+
+    public List<Lesson> allLessons() {
+        ArrayList<Lesson> lessons = new ArrayList<>();
+        try (Cursor cursor = getReadableDatabase().query("lessons", null, null, null, null, null,
+                "day_of_week ASC, begin_section ASC")) {
+            while (cursor.moveToNext()) {
+                Lesson lesson = new Lesson();
+                lesson.id = columnText(cursor, "id");
+                lesson.name = columnText(cursor, "name");
+                lesson.teacher = columnText(cursor, "teacher");
+                lesson.location = columnText(cursor, "location");
+                lesson.dayOfWeek = columnInt(cursor, "day_of_week", 0);
+                lesson.beginSection = columnInt(cursor, "begin_section", 0);
+                lesson.sections = columnInt(cursor, "sections", 1);
+                lesson.weeks = columnText(cursor, "weeks");
+                if (lesson.dayOfWeek > 0 && lesson.beginSection > 0 && !lesson.name.isEmpty()) {
+                    lessons.add(lesson);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return lessons;
+    }
+
+    private static String columnText(Cursor cursor, String column) {
+        int index = cursor.getColumnIndex(column);
+        if (index < 0 || cursor.isNull(index)) {
+            return "";
+        }
+        String value = cursor.getString(index);
+        return value == null ? "" : value;
+    }
+
+    private static int columnInt(Cursor cursor, String column, int fallback) {
+        int index = cursor.getColumnIndex(column);
+        return index < 0 ? fallback : cursor.getInt(index);
+    }
+
+    public long scheduleFirstWeekDate() {
+        return schedulePrefs().getLong(KEY_FIRST_WEEK_DATE, 0L);
+    }
+
+    public String scheduleSectionTimes() {
+        return schedulePrefs().getString(KEY_SECTION_TIMES, "");
+    }
+
+    public long scheduleUpdatedAt() {
+        return schedulePrefs().getLong(KEY_SCHEDULE_UPDATED_AT, 0L);
+    }
+
+    private SharedPreferences schedulePrefs() {
+        return context.getSharedPreferences(SCHEDULE_PREFS, Context.MODE_PRIVATE);
     }
 
     public int countAll() {
@@ -582,6 +1057,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         prefs().edit()
                 .putStringSet(KEY_BLOCKED_RULES, rules)
                 .apply();
+        blockedRulesCache = rules;
         syncCourseScanState(cleanCourse);
     }
 
@@ -591,11 +1067,13 @@ public final class DeadlineStore extends SQLiteOpenHelper {
                 .remove(KEY_LEGACY_COURSES)
                 .remove(KEY_BLOCKED_RULES)
                 .apply();
+        legacyCoursesCache = new HashSet<>();
+        blockedRulesCache = new HashSet<>();
         CourseScanScores.restoreFromNeverScan(context, refs[0], refs[1]);
     }
 
     public Set<String> blockedCourses() {
-        Set<String> result = new HashSet<>(prefs().getStringSet(KEY_LEGACY_COURSES, new HashSet<>()));
+        Set<String> result = new HashSet<>(legacyCourses());
         for (String rule : blockedRules()) {
             int bar = rule.lastIndexOf('|');
             if (bar > 0) {
@@ -618,8 +1096,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
             return true;
         }
         String cleanCourse = course.trim();
-        Set<String> legacyCourses = prefs().getStringSet(KEY_LEGACY_COURSES, new HashSet<>());
-        if (legacyCourses.contains(cleanCourse)) {
+        if (legacyCourses().contains(cleanCourse)) {
             return false;
         }
         Set<String> rules = blockedRules();
@@ -635,10 +1112,11 @@ public final class DeadlineStore extends SQLiteOpenHelper {
             return;
         }
         Set<String> rules = new HashSet<>(blockedRules());
-        rules.add(blockKey(cleanCourse, TYPE_HOMEWORK));
-        rules.add(blockKey(cleanCourse, TYPE_EXAM));
-        rules.add(blockKey(cleanCourse, TYPE_CHAPTER));
+        for (String type : managedTypes()) {
+            rules.add(blockKey(cleanCourse, type));
+        }
         prefs().edit().putStringSet(KEY_BLOCKED_RULES, rules).apply();
+        blockedRulesCache = rules;
     }
 
     public List<String> knownCourses() {
@@ -732,7 +1210,27 @@ public final class DeadlineStore extends SQLiteOpenHelper {
     }
 
     private Set<String> blockedRules() {
-        return new HashSet<>(prefs().getStringSet(KEY_BLOCKED_RULES, new HashSet<>()));
+        Set<String> cached = blockedRulesCache;
+        if (cached == null) {
+            cached = new HashSet<>(prefs().getStringSet(KEY_BLOCKED_RULES, new HashSet<>()));
+            blockedRulesCache = cached;
+        }
+        return cached;
+    }
+
+    private Set<String> legacyCourses() {
+        Set<String> cached = legacyCoursesCache;
+        if (cached == null) {
+            cached = new HashSet<>(prefs().getStringSet(KEY_LEGACY_COURSES, new HashSet<>()));
+            legacyCoursesCache = cached;
+        }
+        return cached;
+    }
+
+    /** Drops the in-memory settings caches; next read reloads from prefs. */
+    static void invalidateSettingCaches() {
+        legacyCoursesCache = null;
+        blockedRulesCache = null;
     }
 
     private SharedPreferences prefs() {

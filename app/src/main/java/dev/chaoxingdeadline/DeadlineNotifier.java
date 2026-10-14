@@ -14,6 +14,7 @@ import android.util.Log;
 
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +30,14 @@ public final class DeadlineNotifier {
     public static final String CHANNEL_QUIET = "deadline_quiet";
     /** Daily digest: one morning summary notification. */
     public static final String CHANNEL_DIGEST = "deadline_digest";
+    /**
+     * Permanent "next deadline" notification — the one HyperOS 2 lifts into the 超级岛.
+     * Low importance so it never buzzes; it is an ambient at-a-glance view.
+     */
+    public static final String CHANNEL_LIVE = "deadline_live";
+    private static final int LIVE_NOTIFICATION_ID = 0x4C49;
+    /** Progress window: the bar fills over the last 24h before the deadline. */
+    private static final long LIVE_WINDOW_MS = TimeUnit.HOURS.toMillis(24);
 
     private static final String PREFS = "deadline_notify";
     private static final String KEY_ALARMS = "scheduled_alarms";
@@ -51,7 +60,7 @@ public final class DeadlineNotifier {
             return;
         }
         createChannel(manager, CHANNEL_ID, "\u622a\u6b62\u63d0\u9192",
-                "\u5b66\u4e60\u901a\u4f5c\u4e1a\u3001\u8003\u8bd5\u548c\u7ae0\u8282\u4efb\u52a1\u7684\u63d0\u524d\u63d0\u9192",
+                "\u5b66\u4e60\u901a\u4f5c\u4e1a\u3001\u8003\u8bd5\u3001\u7ae0\u8282\u4efb\u52a1\u548c\u8bfe\u5802\u6d3b\u52a8\u7684\u63d0\u524d\u63d0\u9192",
                 NotificationManager.IMPORTANCE_DEFAULT);
         createChannel(manager, CHANNEL_URGENT, "\u5373\u5c06\u622a\u6b62",
                 "\u5269\u4f5930\u5206\u949f\u5185\u622a\u6b62\u6216\u5df2\u5230\u622a\u6b62\u65f6\u95f4\u7684\u7d27\u6025\u63d0\u9192",
@@ -62,6 +71,9 @@ public final class DeadlineNotifier {
         createChannel(manager, CHANNEL_DIGEST, "每日摘要",
                 "每天定时推送的待办汇总，列出今天和未来 3 天的截止项",
                 NotificationManager.IMPORTANCE_DEFAULT);
+        createChannel(manager, CHANNEL_LIVE, "最近截止（超级岛）",
+                "常驻显示最近截止的待办，小米超级岛 / 实时活动会渲染这条通知",
+                NotificationManager.IMPORTANCE_LOW);
     }
 
     private static void createChannel(NotificationManager manager, String id,
@@ -90,7 +102,11 @@ public final class DeadlineNotifier {
         }
         DeadlineItem item = new DeadlineStore(context).itemById(id);
         if (item != null) {
-            long offset = offsetMillis >= 0L ? offsetMillis : AppSettings.notifyOffsetsMillis(context)[0];
+            long[] offsets = AppSettings.notifyOffsetsMillis(context, item.type);
+            // A type with no offsets at all (classroom activities without the due switch)
+            // has no [0] to fall back to.
+            long offset = offsetMillis >= 0L ? offsetMillis
+                    : (offsets.length > 0 ? offsets[0] : NO_OFFSET);
             notifyNow(context, item, offset, false);
         }
         rescheduleAll(context);
@@ -129,9 +145,10 @@ public final class DeadlineNotifier {
         cleanupSentMarkers(context, items);
         ensureChannel(context);
         long now = System.currentTimeMillis();
-        long[] offsets = AppSettings.notifyOffsetsMillis(context);
         HashSet<String> scheduled = new HashSet<>();
         for (DeadlineItem item : items) {
+            // Per-type advance hours: an exam and a homework can remind at different leads.
+            long[] offsets = AppSettings.notifyOffsetsMillis(context, item.type);
             boolean notifiable = canNotify(context, item, now);
             if (!notifiable && !dueTimeReminderStillPending(context, item, offsets, now)) {
                 continue;
@@ -170,6 +187,105 @@ public final class DeadlineNotifier {
             }
         }
         prefs(context).edit().putStringSet(KEY_ALARMS, scheduled).apply();
+        updateLiveNotification(context, items);
+    }
+
+    // -- 超级岛 / 常驻「最近截止」实时通知 (HyperOS 2 Live Updates) --
+
+    /**
+     * The next deadline to keep in the permanent notification. HyperOS 2 renders an
+     * ongoing progress notification in the 超级岛; other OEMs show it as a low-priority
+     * ongoing notice. Submitted / revoked / past-due rows are skipped, and the list is
+     * already type- and block-filtered by the caller (activeItems).
+     */
+    static DeadlineItem pickLiveItem(List<DeadlineItem> items) {
+        if (items == null || items.isEmpty()) {
+            return null;
+        }
+        long now = System.currentTimeMillis();
+        DeadlineItem best = null;
+        for (DeadlineItem item : items) {
+            if (item == null || item.submitted || item.vanishedAt > 0L || item.dueAt <= now) {
+                continue;
+            }
+            if (best == null || item.dueAt < best.dueAt) {
+                best = item;
+            }
+        }
+        return best;
+    }
+
+    /** Post or refresh the permanent 超级岛 notification; cancel it when nothing is due. */
+    public static void updateLiveNotification(Context context, List<DeadlineItem> items) {
+        android.app.NotificationManager manager =
+                context.getSystemService(android.app.NotificationManager.class);
+        if (manager == null) {
+            return;
+        }
+        if (!AppSettings.liveNotificationEnabled(context)) {
+            manager.cancel(LIVE_NOTIFICATION_ID);
+            return;
+        }
+        ensureChannel(context);
+        DeadlineItem item = pickLiveItem(items);
+        if (item == null) {
+            manager.cancel(LIVE_NOTIFICATION_ID);
+            return;
+        }
+        long now = System.currentTimeMillis();
+        long start = item.dueAt - LIVE_WINDOW_MS;
+        if (start < 0L || start >= item.dueAt) {
+            start = now;
+        }
+        int progress = item.dueAt <= start ? 100
+                : (int) Math.max(0L, Math.min(100L, (now - start) * 100L / (item.dueAt - start)));
+        android.content.Intent intent = new android.content.Intent(context, MainActivity.class);
+        intent.setFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                | android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        android.app.PendingIntent pending = android.app.PendingIntent.getActivity(
+                context, LIVE_NOTIFICATION_ID, intent,
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT | android.app.PendingIntent.FLAG_IMMUTABLE);
+        String course = item.course == null ? "" : item.course;
+        android.app.Notification.Builder builder = new android.app.Notification.Builder(context, CHANNEL_LIVE)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle(item.title)
+                .setContentText((course.isEmpty() ? "" : course + " · ")
+                        + "剩余 " + formatRemaining(item.dueAt - now))
+                .setOngoing(true)
+                .setAutoCancel(false)
+                .setShowWhen(false)
+                .setCategory(android.app.Notification.CATEGORY_PROGRESS)
+                .setProgress(100, progress, false)
+                .setContentIntent(pending);
+        try {
+            manager.notify(LIVE_NOTIFICATION_ID, builder.build());
+        } catch (Throwable ignored) {
+            // Some OEM builds refuse ongoing progress notices; nothing else to do.
+        }
+    }
+
+    public static void cancelLiveNotification(Context context) {
+        android.app.NotificationManager manager =
+                context.getSystemService(android.app.NotificationManager.class);
+        if (manager != null) {
+            manager.cancel(LIVE_NOTIFICATION_ID);
+        }
+    }
+
+    private static String formatRemaining(long millis) {
+        if (millis <= 0L) {
+            return "已截止";
+        }
+        long minutes = millis / 60_000L;
+        if (minutes < 60L) {
+            return minutes + " 分钟";
+        }
+        long hours = minutes / 60L;
+        if (hours < 24L) {
+            return hours + " 小时 " + (minutes % 60L) + " 分";
+        }
+        long days = hours / 24L;
+        return days + " 天 " + (hours % 24L) + " 小时";
     }
 
     /**
@@ -179,7 +295,7 @@ public final class DeadlineNotifier {
      */
     private static boolean dueTimeReminderStillPending(
             Context context, DeadlineItem item, long[] offsets, long now) {
-        if (item.submitted || item.dueAt > now) {
+        if (item.submitted || item.vanishedAt > 0L || item.dueAt > now) {
             return false;
         }
         boolean dueTimeEnabled = false;
@@ -367,7 +483,7 @@ public final class DeadlineNotifier {
             return;
         }
         SharedPreferences.Editor editor = prefs(context).edit();
-        for (long offset : AppSettings.notifyOffsetsMillis(context)) {
+        for (long offset : AppSettings.notifyOffsetsMillis(context, item.type)) {
             editor.putBoolean(sentKey(item, offset), true);
         }
         editor.apply();
@@ -404,6 +520,7 @@ public final class DeadlineNotifier {
         return item != null
                 && item.id != null && !item.id.isEmpty()
                 && !item.submitted
+                && item.vanishedAt <= 0L
                 && item.dueAt > now
                 && AppSettings.shouldNotifyType(context, item.type);
     }
@@ -429,7 +546,7 @@ public final class DeadlineNotifier {
             return;
         }
         long bestOffset = NO_OFFSET;
-        for (long offset : AppSettings.notifyOffsetsMillis(context)) {
+        for (long offset : AppSettings.notifyOffsetsMillis(context, item.type)) {
             if (item.dueAt - offset > now || !shouldCatchUp(item, offset, now)) {
                 continue;
             }
@@ -487,19 +604,42 @@ public final class DeadlineNotifier {
                 .setStyle(new android.app.Notification.BigTextStyle().bigText(bigText(item, offsetMillis, catchUp)))
                 .setContentIntent(contentIntent)
                 .setAutoCancel(true)
+                .addAction(notificationAction(context, android.R.drawable.ic_menu_save,
+                        "\u6807\u8bb0\u4e3a\u5df2\u5b8c\u6210", actionIntent(context, DeadlineReceiver.ACTION_MARK_DONE, item.id)))
                 .addAction(notificationAction(context, android.R.drawable.ic_menu_recent_history,
                         "\u7a0d\u540e 30 \u5206\u949f", actionIntent(context, DeadlineReceiver.ACTION_SNOOZE, item.id)))
                 .addAction(notificationAction(context, android.R.drawable.ic_menu_view,
                         "\u6253\u5f00\u5b66\u4e60\u901a", openChaoxingIntent(context)))
                 .addAction(notificationAction(context, android.R.drawable.ic_menu_close_clear_cancel,
-                        "\u5ffd\u7565\u672c\u6b21", actionIntent(context, DeadlineReceiver.ACTION_IGNORE, item.id)))
-                .addAction(notificationAction(context, android.R.drawable.ic_menu_delete,
-                        "\u5220\u9664\u5f85\u529e", actionIntent(context, DeadlineReceiver.ACTION_DELETE, item.id)));
+                        "\u5ffd\u7565\u672c\u6b21", actionIntent(context, DeadlineReceiver.ACTION_IGNORE, item.id)));
         NotificationManager manager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
         if (manager != null) {
             manager.notify(notificationId(item), builder.build());
             prefs.edit().putBoolean(key, true).apply();
         }
+    }
+
+    /**
+     * Mark an item done straight from the notification shade — the most common thing to
+     * do right after submitting the work in Chaoxing, before the next capture notices.
+     * Deletion stays in the in-app item menu (it always did per the 1.8.0 changelog;
+     * the shade button was a leftover).
+     */
+    public static void markDone(Context context, String id) {
+        if (id == null || id.isEmpty()) {
+            return;
+        }
+        DeadlineStore store = new DeadlineStore(context);
+        DeadlineItem item = store.itemById(id);
+        if (item == null) {
+            return;
+        }
+        store.setSubmitted(id, true);
+        cancelNotification(context, item);
+        rescheduleAll(context);
+        OverlayBridge.publish(context);
+        DeadlineWidgetProvider.updateAll(context);
+        context.sendBroadcast(new Intent(DeadlineReceiver.ACTION_REFRESH).setPackage(context.getPackageName()));
     }
 
     /** Urgent (<= 30 min left or due now) gets heads-up; quiet hours downgrade everything. */
@@ -550,7 +690,8 @@ public final class DeadlineNotifier {
         DeadlineItem item = new DeadlineStore(context).itemById(id);
         // Re-check everything that could have changed during the 30 quiet minutes: the item
         // may be done, and the type's notifications may have been switched off meanwhile.
-        if (item == null || item.submitted || !AppSettings.shouldNotifyType(context, item.type)) {
+        if (item == null || item.submitted || item.vanishedAt > 0L
+                || !AppSettings.shouldNotifyType(context, item.type)) {
             return;
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
@@ -565,6 +706,8 @@ public final class DeadlineNotifier {
                 .setStyle(new android.app.Notification.BigTextStyle().bigText(bigText(item, SNOOZE_LABEL, false)))
                 .setContentIntent(openModuleIntent(context, item))
                 .setAutoCancel(true)
+                .addAction(notificationAction(context, android.R.drawable.ic_menu_save,
+                        "\u6807\u8bb0\u4e3a\u5df2\u5b8c\u6210", actionIntent(context, DeadlineReceiver.ACTION_MARK_DONE, item.id)))
                 .addAction(notificationAction(context, android.R.drawable.ic_menu_recent_history,
                         "\u7a0d\u540e 30 \u5206\u949f", actionIntent(context, DeadlineReceiver.ACTION_SNOOZE, item.id)))
                 .addAction(notificationAction(context, android.R.drawable.ic_menu_view,
@@ -574,6 +717,18 @@ public final class DeadlineNotifier {
         NotificationManager manager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
         if (manager != null) {
             manager.notify(notificationId(item), builder.build());
+        }
+    }
+
+    /** Dismiss posted reminders for items flagged as probably revoked. */
+    public static void cancelVanishedNotifications(Context context) {
+        try {
+            for (DeadlineItem item : new DeadlineStore(context).activeItems()) {
+                if (item.vanishedAt > 0L) {
+                    cancelNotification(context, item);
+                }
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -666,18 +821,26 @@ public final class DeadlineNotifier {
         return builder.toString();
     }
 
+    /**
+     * Drop "sent" markers whose item is gone or whose deadline moved.
+     *
+     * Keys are {@code sent_<id>_<dueAt>_<offset>} and the id itself contains underscores
+     * (stableId is type_hex), so the old startsWith-against-every-prefix loop was
+     * O(items × markers). Parsing from the right and looking the id up in a map makes it
+     * linear; malformed keys are removed rather than kept.
+     */
     private static void cleanupSentMarkers(Context context, List<DeadlineItem> items) {
         SharedPreferences prefs = prefs(context);
         Map<String, ?> all = prefs.getAll();
         if (all.isEmpty()) {
             return;
         }
-        HashSet<String> validPrefixes = new HashSet<>();
+        Map<String, Set<Long>> valid = new HashMap<>();
         for (DeadlineItem item : items) {
             if (item == null || item.id == null || item.id.isEmpty()) {
                 continue;
             }
-            validPrefixes.add("sent_" + item.id + "_" + item.dueAt + "_");
+            valid.computeIfAbsent(item.id, k -> new HashSet<>()).add(item.dueAt);
         }
         SharedPreferences.Editor editor = prefs.edit();
         boolean changed = false;
@@ -685,17 +848,22 @@ public final class DeadlineNotifier {
             if (!key.startsWith("sent_")) {
                 continue;
             }
-            boolean keep = false;
-            for (String prefix : validPrefixes) {
-                if (key.startsWith(prefix)) {
-                    keep = true;
-                    break;
+            int last = key.lastIndexOf('_');
+            int prev = last > 0 ? key.lastIndexOf('_', last - 1) : -1;
+            Long dueAt = null;
+            if (prev > "sent_".length() - 1) {
+                try {
+                    dueAt = Long.valueOf(key.substring(prev + 1, last));
+                } catch (NumberFormatException ignored) {
+                    dueAt = null;
                 }
             }
-            if (!keep) {
-                editor.remove(key);
-                changed = true;
+            Set<Long> dues = dueAt == null ? null : valid.get(key.substring("sent_".length(), prev));
+            if (dues != null && dues.contains(dueAt)) {
+                continue;
             }
+            editor.remove(key);
+            changed = true;
         }
         if (changed) {
             editor.apply();

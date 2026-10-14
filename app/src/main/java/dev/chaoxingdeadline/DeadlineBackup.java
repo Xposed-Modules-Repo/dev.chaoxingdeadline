@@ -2,6 +2,7 @@ package dev.chaoxingdeadline;
 
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -9,20 +10,31 @@ import org.json.JSONObject;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Export / import helpers. The module owns no cloud storage and holds no INTERNET
  * permission, so backup is a plain file the user picks: JSON round-trips this module's
- * own data, ICS drops the same deadlines into any calendar app.
+ * own data (todos plus settings), ICS drops the same deadlines into any calendar app.
+ *
+ * Settings cover the three module-local preference files. The bridge-auth token file is
+ * deliberately NOT included: it is a device-local secret, and a fresh install generates
+ * its own on first launch.
  */
 public final class DeadlineBackup {
     public static final String FORMAT = "chaoxingdeadline-backup";
-    public static final int VERSION = 1;
+    public static final int VERSION = 2;
     private static final String PRODID = "-//dev.chaoxingdeadline//Deadline//CN";
+    private static final String[] SETTINGS_FILES = {
+            AppSettings.PREFS, AppSettings.WIDGET_PREFS, DeadlineStore.PREFS
+    };
 
     private DeadlineBackup() {
     }
@@ -37,11 +49,21 @@ public final class DeadlineBackup {
             items.put(item.toJson());
         }
         root.put("items", items);
+        root.put("settings", exportSettings(context));
         return root;
     }
 
     /** Number of items actually restored; -1 when the payload is not a backup file. */
     public static int importJson(Context context, String payload, boolean replaceExisting) {
+        return importJson(context, payload, replaceExisting, false);
+    }
+
+    /**
+     * @param restoreSettings when true, a v2 file's settings section replaces the current
+     *        settings and course-block rules; v1 files without that section leave them be.
+     */
+    public static int importJson(Context context, String payload, boolean replaceExisting,
+                                 boolean restoreSettings) {
         if (payload == null || payload.trim().isEmpty()) {
             return -1;
         }
@@ -80,7 +102,13 @@ public final class DeadlineBackup {
                 store.upsert(item);
                 restored++;
             }
+            int settingsRestored = restoreSettings ? importSettings(context, root) : 0;
+            if (settingsRestored > 0) {
+                // The launcher alias is driven by a component setting, not just the pref.
+                AppSettings.setLauncherHidden(context, AppSettings.launcherHidden(context));
+            }
             DeadlineNotifier.rescheduleAll(context);
+            DeadlineNotifier.scheduleNextDigest(context);
             OverlayBridge.publish(context);
             DeadlineWidgetProvider.updateAll(context);
             context.sendBroadcast(new Intent(DeadlineReceiver.ACTION_REFRESH)
@@ -89,6 +117,79 @@ public final class DeadlineBackup {
         } catch (Throwable throwable) {
             return -1;
         }
+    }
+
+    private static JSONObject exportSettings(Context context) throws Exception {
+        JSONObject settings = new JSONObject();
+        for (String file : SETTINGS_FILES) {
+            settings.put(file, prefsToJson(context.getSharedPreferences(file, Context.MODE_PRIVATE)));
+        }
+        return settings;
+    }
+
+    private static JSONObject prefsToJson(SharedPreferences prefs) throws Exception {
+        JSONObject json = new JSONObject();
+        for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof Set) {
+                JSONArray array = new JSONArray();
+                for (String item : (Set<String>) value) {
+                    array.put(item);
+                }
+                json.put(entry.getKey(), array);
+            } else {
+                json.put(entry.getKey(), value);
+            }
+        }
+        return json;
+    }
+
+    /** @return how many preference files were replaced (0 when the file has no settings). */
+    private static int importSettings(Context context, JSONObject root) {
+        JSONObject settings = root.optJSONObject("settings");
+        if (settings == null) {
+            return 0;
+        }
+        int restored = 0;
+        for (String file : SETTINGS_FILES) {
+            JSONObject json = settings.optJSONObject(file);
+            if (json == null) {
+                continue;
+            }
+            SharedPreferences.Editor editor =
+                    context.getSharedPreferences(file, Context.MODE_PRIVATE).edit();
+            editor.clear();
+            Iterator<String> keys = json.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                Object value = json.opt(key);
+                if (value instanceof JSONArray) {
+                    JSONArray array = (JSONArray) value;
+                    Set<String> set = new HashSet<>();
+                    for (int i = 0; i < array.length(); i++) {
+                        set.add(array.optString(i));
+                    }
+                    editor.putStringSet(key, set);
+                } else if (value instanceof Boolean) {
+                    editor.putBoolean(key, (Boolean) value);
+                } else if (value instanceof Integer) {
+                    editor.putInt(key, (Integer) value);
+                } else if (value instanceof Long) {
+                    editor.putLong(key, (Long) value);
+                } else if (value instanceof Double) {
+                    editor.putFloat(key, ((Double) value).floatValue());
+                } else if (value instanceof String) {
+                    editor.putString(key, (String) value);
+                }
+            }
+            editor.apply();
+            restored++;
+        }
+        if (restored > 0) {
+            AppSettings.syncRemotePreferences(context);
+            DeadlineStore.invalidateSettingCaches();
+        }
+        return restored;
     }
 
     /** RFC 5545 calendar with one VEVENT per deadline and a single advance alarm. */

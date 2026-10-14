@@ -66,7 +66,7 @@ public final class AboutActivity extends BaseActivity {
         author.setOnClickListener(v -> startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(UPSTREAM_URL))));
         content.addView(author, groupParams());
 
-        View maintainer = actionRow("修改维护 · suiren0219", "本 fork：桌面小组件、深色模式入口");
+        View maintainer = actionRow("修改维护 · suiren0219", "本 fork：桌面小组件、课堂活动、免打扰与每日摘要");
         maintainer.setOnClickListener(v -> startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(FORK_URL))));
         content.addView(maintainer, groupParams());
 

@@ -4,14 +4,16 @@ import android.annotation.SuppressLint;
 import android.app.Application;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
-import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -21,9 +23,6 @@ import android.view.View;
 import android.view.Window;
 import android.webkit.CookieManager;
 import android.widget.FrameLayout;
-import android.widget.LinearLayout;
-import android.widget.ScrollView;
-import android.widget.Space;
 import android.widget.TextView;
 
 import org.json.JSONArray;
@@ -37,25 +36,19 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -67,16 +60,27 @@ import java.util.regex.Pattern;
  * - Active refresh (fetchUrl) proactively pulls course/work/exam lists via Chaoxing HTTP APIs.
  * - Items flow: inspect() -> DeadlineParser -> enrichCourseName() -> emit() -> DeadlineReceiver -> DeadlineStore.
  * - COURSE_NAMES: in-memory cache populated from active course list fetch, used to resolve course names from IDs.
+ *
+ * Split from the original single-file hook: OverlayViews builds the in-host dialogs,
+ * CourseRefs parses course references, CourseScanner runs the per-course deadline scan.
  */
+import dev.chaoxingdeadline.CourseRefs.CourseRef;
+import dev.chaoxingdeadline.OverlayViews.OverlayTodo;
 import io.github.libxposed.api.XposedModule;
 
 public final class ChaoxingHook extends XposedModule {
     private static final String TAG = "ChaoxingDeadline";
-    private static final String HOOK_VERSION = "1.5";
+    private static final String HOOK_VERSION = "1.12";
     private static final String TARGET_PACKAGE = "com.chaoxing.mobile";
-    private static final String MODULE_PACKAGE = "dev.chaoxingdeadline";
+    static final String MODULE_PACKAGE = "dev.chaoxingdeadline";
     private static final long AUTO_REFRESH_MIN_GAP_MS = 3L * 60L * 1000L;
     private static final long OVERLAY_REALTIME_WAIT_MS = 2000L;
+    // Opening Chaoxing used to stack several popups: one per captured item on the
+    // intercept path, one after the active refresh, plus the retry-after-dismiss. The
+    // fingerprint guard only collapses identical content, so consecutive different
+    // popups still queued up. Throttle by wall-clock time as well — two minutes
+    // between popups. Notifications are unaffected; this is only the in-app overlay.
+    private static final long OVERLAY_MIN_INTERVAL_MS = 120_000L;
     private static final String HOME_BUTTON_TAG = "chaoxing_deadline_home_button";
     private static final int DEFAULT_OVERLAY_WINDOW_HOURS = 24;
     private static final int OVERLAY_WINDOW_ALL_HOURS = -1;
@@ -86,6 +90,32 @@ public final class ChaoxingHook extends XposedModule {
     private static final ThreadLocal<Boolean> PARSING = ThreadLocal.withInitial(() -> false);
     private static final ArrayList<DeadlineItem> PENDING = new ArrayList<>();
     private static final Set<String> FETCHED_URLS = new HashSet<>();
+    // Weekly timetable (课程表) captured from Chaoxing, kept in-process for the
+    // in-class activity boost; the module process keeps its own copy for the widget.
+    private static final List<Lesson> LESSONS = new ArrayList<>();
+    private static volatile long firstWeekDate;
+    private static volatile String sectionTimesJson = "";
+    private static volatile String lastTimetableSignature;
+    /** Shapes of timetable-ish payloads that failed to parse, logged once each. */
+    private static final Set<String> UNKNOWN_TIMETABLE_SIGNATURES = new HashSet<>();
+    /** curriculumUuid from the last timetable URL seen; identifies which timetable. */
+    private static volatile String curriculumUuid = "";
+    // Course name -> "courseId|classId", built whenever the timetable lands, so a class
+    // session can be mapped onto the course whose activities should be polled.
+    private static final Map<String, String> COURSE_KEYS_BY_NAME = new HashMap<>();
+    private static final String TIMETABLE_URL =
+            "https://kb.chaoxing.com/pc/curriculum/getMyLessons";
+    // In-class boost: one activity-list refresh per course at most this often, only
+    // during the first minutes of a session (where sign-ins actually happen).
+    private static final long SESSION_TICK_MS = 60_000L;
+    private static final long SESSION_BOOST_WINDOW_MS = 15L * 60L * 1000L;
+    private static final long SESSION_REFRESH_GAP_MS = 2L * 60L * 1000L;
+    private volatile long lastSessionRefreshAt;
+    private volatile boolean sessionTickScheduled;
+    // Item ids emitted during the current active-refresh round; the round snapshot sent
+    // to the module process drives revoked-deadline detection (see CourseScanner).
+    private static final Set<String> SEEN_ITEM_IDS = new HashSet<>();
+    private static final int SEEN_ITEM_IDS_LIMIT = 4000;
     private static final Set<String> COURSE_FIELD_SIGNATURES = new HashSet<>();
     private static final Map<String, String> COURSE_NAMES = new HashMap<>();
     private static final Map<Object, ParseContext> RESPONSE_CONTEXTS = Collections.synchronizedMap(new WeakHashMap<>());
@@ -109,9 +139,9 @@ public final class ChaoxingHook extends XposedModule {
     private static volatile long overlayRealtimeShownAt;
     private static volatile Boolean overlayEnabledOverride;
     private static volatile int overlayWindowHoursOverride = Integer.MIN_VALUE;
-    private static volatile int lastCourseScanThreads;
-    private static volatile int lastCourseScanRefs;
-    private static volatile int lastCourseScanScanned;
+    static volatile int lastCourseScanThreads;
+    static volatile int lastCourseScanRefs;
+    static volatile int lastCourseScanScanned;
     private static volatile boolean activeRefreshRunning;
     private static volatile boolean foregroundRefreshStarted;
 
@@ -139,152 +169,7 @@ public final class ChaoxingHook extends XposedModule {
         installOkHttpHooks(param.getClassLoader());
         installWebViewHooks();
         installActivityOverlayHook();
-        installDarkModeForce(param.getClassLoader());
         emitStatus("hooks installed", "onPackageReady");
-    }
-
-    /**
-     * Experimental forced dark mode for the host.
-     *
-     * Chaoxing ships complete night resources but (as of 7.0.4) renders light:
-     * AppCompatDelegateImpl follows the system-delivered uiMode, and MIUI
-     * hands this app a light configuration because its manifest declares
-     * force_dark_google=true ("adapts dark itself"). The hidden dark settings
-     * page writes preferences that nothing reads, so the shipped dark theme
-     * can never activate. Two in-process hooks flip the decision:
-     *
-     * 1. AppCompatDelegateImpl.calculateNightMode() -> MODE_NIGHT_YES, so
-     *    every AppCompatActivity applies its night resources;
-     * 2. ContextImpl.setResourcesWhenCreate(Resources) (HyperOS-specific
-     *    factory) so application-level resources start night as well.
-     *
-     * Purely in-process argument rewriting: nothing is written to disk and no
-     * system files are touched. Controlled by the dark_mode_force switch
-     * (default on); changes take effect after the host app is restarted.
-     */
-    private void installDarkModeForce(ClassLoader loader) {
-        if (!darkModeForceEnabled()) {
-            log(Log.INFO, TAG, "dark mode force disabled by setting");
-            return;
-        }
-        try {
-            Class<?> delegateImpl = Class.forName(
-                    "androidx.appcompat.app.AppCompatDelegateImpl", false, loader);
-            hook(delegateImpl.getDeclaredMethod("calculateNightMode"))
-                    .setId("darkmode_calculate_night_mode")
-                    .intercept(chain -> {
-                        chain.proceed();
-                        return android.app.UiModeManager.MODE_NIGHT_YES;
-                    });
-            log(Log.INFO, TAG, "dark mode: calculateNightMode hook installed");
-        } catch (Throwable throwable) {
-            log(Log.WARN, TAG, "dark mode: calculateNightMode hook failed", throwable);
-        }
-        try {
-            Class<?> contextImpl = Class.forName("android.app.ContextImpl");
-            hook(contextImpl.getDeclaredMethod("setResourcesWhenCreate",
-                            android.content.res.Resources.class))
-                    .setId("darkmode_set_resources_when_create")
-                    .intercept(chain -> {
-                        Object result = chain.proceed();
-                        try {
-                            Object res = chain.getArg(0);
-                            if (res instanceof android.content.res.Resources) {
-                                android.content.res.Resources resources = (android.content.res.Resources) res;
-                                int ui = resources.getConfiguration().uiMode
-                                        & android.content.res.Configuration.UI_MODE_NIGHT_MASK;
-                                if (ui != android.content.res.Configuration.UI_MODE_NIGHT_YES) {
-                                    android.content.res.Configuration night =
-                                            new android.content.res.Configuration(resources.getConfiguration());
-                                    night.uiMode = (night.uiMode & ~android.content.res.Configuration.UI_MODE_NIGHT_MASK)
-                                            | android.content.res.Configuration.UI_MODE_NIGHT_YES;
-                                    resources.updateConfiguration(night, resources.getDisplayMetrics());
-                                }
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                        return result;
-                    });
-            log(Log.INFO, TAG, "dark mode: setResourcesWhenCreate hook installed");
-        } catch (Throwable throwable) {
-            log(Log.WARN, TAG, "dark mode: setResourcesWhenCreate hook failed", throwable);
-        }
-        // WebView (H5) pages have their own light styling that ignores night
-        // resources. The platform WebView force-dark still applies to this
-        // host because its targetSdk is below 33; turn it on at construction.
-        try {
-            Class<?> webView = Class.forName("android.webkit.WebView");
-            int hooked = 0;
-            for (java.lang.reflect.Constructor<?> ctor : webView.getDeclaredConstructors()) {
-                Class<?>[] params = ctor.getParameterTypes();
-                if (params.length >= 1 && params[0] == android.content.Context.class) {
-                    hook(ctor)
-                            .setId("darkmode_webview_ctor_" + params.length)
-                            .intercept(chain -> {
-                                Object result = chain.proceed();
-                                try {
-                                    Object self = chain.getThisObject();
-                                    if (self instanceof android.webkit.WebView
-                                            && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                        android.webkit.WebSettings settings =
-                                                ((android.webkit.WebView) self).getSettings();
-                                        settings.setForceDark(android.webkit.WebSettings.FORCE_DARK_ON);
-                                    }
-                                } catch (Throwable ignored) {
-                                }
-                                return result;
-                            });
-                    hooked++;
-                }
-            }
-            log(Log.INFO, TAG, "dark mode: WebView force-dark hooked (" + hooked + " ctors)");
-        } catch (Throwable throwable) {
-            log(Log.WARN, TAG, "dark mode: WebView force-dark hook failed", throwable);
-        }
-        // The host's own skin engine paints hardcoded-light views (cards,
-        // input bars) based on its night_mode preference, which defaults to
-        // false and is never written by anything. Feed it "on" so the engine
-        // uses its dark palette on those views too.
-        try {
-            Class<?> prefsImpl = Class.forName("android.app.SharedPreferencesImpl");
-            hook(prefsImpl.getDeclaredMethod("getBoolean", String.class, boolean.class))
-                    .setId("darkmode_night_mode_pref")
-                    .intercept(chain -> {
-                        Object result = chain.proceed();
-                        Object key = chain.getArg(0);
-                        if ("night_mode".equals(key) && Boolean.FALSE.equals(result)) {
-                            return Boolean.TRUE;
-                        }
-                        return result;
-                    });
-            log(Log.INFO, TAG, "dark mode: night_mode pref hook installed");
-        } catch (Throwable throwable) {
-            log(Log.WARN, TAG, "dark mode: night_mode pref hook failed", throwable);
-        }
-    }
-
-    private volatile Boolean darkForceCache;
-
-    private boolean darkModeForceEnabled() {
-        Boolean cached = darkForceCache;
-        if (cached != null) {
-            return cached;
-        }
-        boolean enabled = true;
-        try {
-            enabled = getRemotePreferences(AppSettings.PREFS).getBoolean("dark_mode_force", true);
-        } catch (Throwable ignored) {
-        }
-        darkForceCache = enabled;
-        return enabled;
-    }
-
-    private void setDarkModeForceFromPanel(Context context, boolean enabled) {
-        darkForceCache = enabled;
-        Intent intent = new Intent(DeadlineReceiver.ACTION_SETTINGS_UPDATE);
-        intent.setComponent(new ComponentName(MODULE_PACKAGE, MODULE_PACKAGE + ".DeadlineReceiver"));
-        intent.putExtra("dark_mode_force", enabled);
-        sendAuthenticatedBroadcast(context, intent, "update dark mode force");
     }
 
     @Override
@@ -312,6 +197,7 @@ public final class ChaoxingHook extends XposedModule {
                             if (receiver instanceof Application) {
                                 registerForegroundCallbacks((Application) receiver);
                             }
+                            registerRefreshRequestReceiver();
                             flushPending();
                             emitStatus("active", "Application.attach");
                             log(Log.INFO, TAG, "host context ready");
@@ -489,7 +375,11 @@ public final class ChaoxingHook extends XposedModule {
     private ParseContext contextFromUrl(String prefix, String url) {
         String lower = url == null ? "" : url.toLowerCase(Locale.ROOT);
         String source = prefix;
-        if (lower.contains("work") || lower.contains("homework")) {
+        if (lower.contains("getmylessons") || lower.contains("curriculum")) {
+            source = prefix + ".timetable";
+        } else if (lower.contains("taskactivelist") || lower.contains("activeapi")) {
+            source = prefix + ".activity";
+        } else if (lower.contains("work") || lower.contains("homework")) {
             source = prefix + ".work";
         } else if (lower.contains("exam") || lower.contains("ks_list")) {
             source = prefix + ".exam";
@@ -563,10 +453,343 @@ public final class ChaoxingHook extends XposedModule {
                         }
                         return chain.proceed();
                     });
+            installWebViewResourceHook();
             log(Log.INFO, TAG, "WebView hooks installed");
         } catch (Throwable throwable) {
             log(Log.WARN, TAG, "WebView hook skipped: " + throwable);
         }
+    }
+
+    /**
+     * WebView XHR/fetch responses — how the timetable H5 (schedule.html) actually
+     * receives its data — only surface through shouldInterceptRequest. Two gaps
+     * used to swallow every timetable payload:
+     *
+     * 1. Chaoxing ships its own WebViewClient subclass. When it overrides
+     *    shouldInterceptRequest, a hook on the base class never fires, so we hook
+     *    setWebViewClient and hang the intercept on the concrete class instead
+     *    (both the WebResourceRequest and the deprecated String signature).
+     * 2. When nobody intercepts, the default implementation returns null and the
+     *    WebView core loads the body where no hook can ever see it. For
+     *    timetable-ish URLs we then re-fetch the same URL ourselves (same cookies,
+     *    same referer) so the payload still reaches the parser.
+     */
+    private void installWebViewResourceHook() throws Throwable {
+        hookBaseShouldInterceptRequest(Class.forName("android.webkit.WebViewClient"));
+        hookWebViewClientSetter("android.webkit");
+        // Some builds ship the Tencent X5 kernel instead; its classes mirror the
+        // framework's, and the reflection below is shape-compatible with both.
+        try {
+            Class.forName("com.tencent.smtt.sdk.WebView");
+            hookWebViewClientSetter("com.tencent.smtt.sdk");
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void hookBaseShouldInterceptRequest(Class<?> clientClass) throws Throwable {
+        for (Method method : clientClass.getDeclaredMethods()) {
+            if (!"shouldInterceptRequest".equals(method.getName())
+                    || method.getParameterTypes().length != 2
+                    || !method.getParameterTypes()[1].getName().endsWith("WebResourceRequest")) {
+                continue;
+            }
+            hook(method).setId("webview_should_intercept_request").intercept(chain -> {
+                try {
+                    Object response = chain.proceed();
+                    return inspectWebRequest(chain.getArg(1), response);
+                } catch (Throwable throwable) {
+                    return null;
+                }
+            });
+            return;
+        }
+    }
+
+    /** Watches setWebViewClient so every concrete client class gets hooked once. */
+    private void hookWebViewClientSetter(String pkg) throws Throwable {
+        Class<?> webView = Class.forName(pkg + ".WebView");
+        Class<?> client = Class.forName(pkg + ".WebViewClient");
+        hook(webView.getDeclaredMethod("setWebViewClient", client))
+                .setId("webview_set_client")
+                .intercept(chain -> {
+                    Object result = chain.proceed();
+                    Object instance = chain.getArg(0);
+                    if (instance != null) {
+                        try {
+                            hookWebViewClientClass(instance.getClass());
+                        } catch (Throwable throwable) {
+                            log(Log.WARN, TAG, "client hook skipped: " + throwable);
+                        }
+                    }
+                    return result;
+                });
+    }
+
+    private final Set<Class<?>> HOOKED_WEB_CLIENTS = new HashSet<>();
+
+    /**
+     * Hooks shouldInterceptRequest on the client's own class and every app class
+     * above it up to the framework base — an override can sit on any link of the
+     * chain, and each class is hooked at most once.
+     */
+    private void hookWebViewClientClass(Class<?> clientClass) throws Throwable {
+        if (clientClass == null) {
+            return;
+        }
+        int hooked = 0;
+        Class<?> current = clientClass;
+        while (current != null && !isBaseClientClass(current)) {
+            synchronized (HOOKED_WEB_CLIENTS) {
+                if (!HOOKED_WEB_CLIENTS.add(current)) {
+                    break; // this class and its ancestors are already covered
+                }
+            }
+            hooked += hookShouldInterceptRequest(current);
+            current = current.getSuperclass();
+        }
+        if (hooked > 0) {
+            log(Log.INFO, TAG, "hooked WebViewClient " + clientClass.getName() + " x" + hooked);
+        }
+    }
+
+    private static boolean isBaseClientClass(Class<?> clientClass) {
+        String name = clientClass.getName();
+        return name.startsWith("android.webkit.") || name.startsWith("com.tencent.smtt.sdk.");
+    }
+
+    private int hookShouldInterceptRequest(Class<?> clientClass) throws Throwable {
+        int hooked = 0;
+        for (Method method : clientClass.getDeclaredMethods()) {
+            if (!"shouldInterceptRequest".equals(method.getName())
+                    || method.getParameterTypes().length != 2) {
+                continue;
+            }
+            Class<?> second = method.getParameterTypes()[1];
+            boolean requestSig = second.getName().endsWith("WebResourceRequest");
+            boolean stringSig = second == String.class;
+            if (!requestSig && !stringSig) {
+                continue;
+            }
+            hook(method).setId("webview_client_should_intercept_request").intercept(chain -> {
+                try {
+                    Object response = chain.proceed();
+                    return inspectWebRequest(chain.getArg(1), response);
+                } catch (Throwable throwable) {
+                    return null;
+                }
+            });
+            hooked++;
+        }
+        return hooked;
+    }
+
+    /**
+     * One shouldInterceptRequest call: learn the URL, hand the body to the parser
+     * when somebody produced one (rebuilding it so the page still gets its bytes),
+     * and self-fetch when the WebView core would have loaded it unseen.
+     */
+    private Object inspectWebRequest(Object request, Object response) {
+        String url = urlFromWebRequest(request);
+        if (url == null || url.isEmpty() || !shouldInspectWebResponse(url)) {
+            return response;
+        }
+        rememberCurriculumUuid(url);
+        byte[] bytes = readWebResponseBytes(response);
+        if (bytes != null && bytes.length > 0) {
+            try {
+                inspect(new String(bytes, StandardCharsets.UTF_8), contextFromUrl("WebView", url));
+            } catch (Throwable ignored) {
+            }
+            return rebuildWebResponse(response, bytes);
+        }
+        maybeSelfFetchTimetable(url);
+        return response;
+    }
+
+    /** URL from either shouldInterceptRequest signature; reflection covers X5 too. */
+    private static String urlFromWebRequest(Object request) {
+        if (request instanceof String) {
+            return (String) request;
+        }
+        try {
+            Method getUrl = request.getClass().getMethod("getUrl");
+            Object uri = getUrl.invoke(request);
+            return uri == null ? "" : uri.toString();
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static byte[] readWebResponseBytes(Object response) {
+        if (response == null) {
+            return null;
+        }
+        try {
+            Method getData = response.getClass().getMethod("getData");
+            Object data = getData.invoke(response);
+            if (data instanceof java.io.InputStream) {
+                return readCapped((java.io.InputStream) data, 2_000_000);
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /** Same response, same bytes — reading getData() consumed the original stream. */
+    private static Object rebuildWebResponse(Object response, byte[] bytes) {
+        try {
+            Constructor<?> constructor = response.getClass().getConstructor(
+                    String.class, String.class, java.io.InputStream.class);
+            return constructor.newInstance(
+                    stringMethod(response, "getMimeType"),
+                    stringMethod(response, "getEncoding"),
+                    new java.io.ByteArrayInputStream(bytes));
+        } catch (Throwable throwable) {
+            return response;
+        }
+    }
+
+    private static String stringMethod(Object target, String name) {
+        try {
+            Method method = target.getClass().getMethod(name);
+            Object value = method.invoke(target);
+            return value == null ? "" : String.valueOf(value);
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static final String[] WEB_STATIC_EXTS = {
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp",
+            ".css", ".js", ".woff", ".woff2", ".ttf", ".eot", ".otf",
+            ".mp4", ".mp3", ".webm"
+    };
+
+    private static boolean shouldInspectWebResponse(String url) {
+        if (url == null || url.isEmpty()) {
+            return false;
+        }
+        String lower = url.toLowerCase(Locale.ROOT);
+        int query = lower.indexOf('?');
+        String path = query > 0 ? lower.substring(0, query) : lower;
+        for (String ext : WEB_STATIC_EXTS) {
+            if (path.endsWith(ext)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * The WebView core loads anything nobody intercepted — no hook can read that
+     * body. For timetable-ish URLs we re-fetch the same URL ourselves (same
+     * cookies, same referer) so a GET XHR still reaches the parser. Async: this
+     * runs on a WebView network thread and blocking it would stall the page.
+     */
+    private void maybeSelfFetchTimetable(String url) {
+        String lower = url.toLowerCase(Locale.ROOT);
+        if (!lower.contains("chaoxing")) {
+            return;
+        }
+        boolean timetableish = lower.contains("curriculum")
+                || lower.contains("schedule")
+                || lower.contains("lesson")
+                || !queryParam(url, "curriculumUuid", "curriculumuuid", "curriculum_uuid").isEmpty();
+        if (!timetableish) {
+            return;
+        }
+        Thread worker = new Thread(() -> {
+            try {
+                int found = fetchUrl(url, ParseContext.fromSource("active.timetable", url), null);
+                log(Log.INFO, TAG, "self-fetched timetable url, items=" + found + ": " + url);
+            } catch (Throwable ignored) {
+            }
+        }, "ChaoxingDeadlineWebFetch");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private volatile boolean refreshReceiverRegistered;
+
+    /**
+     * The module app's refresh buttons have to reach into this process: the hook
+     * drives all capture and nothing else can ask for a round. Registered exported
+     * (the module app is a different uid) but token-authenticated — the token lives
+     * in the module's remote prefs, which the module app keeps in sync.
+     */
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
+    private void registerRefreshRequestReceiver() {
+        if (refreshReceiverRegistered) {
+            return;
+        }
+        Context context = ensureHostContext();
+        if (context == null) {
+            return;
+        }
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                handleRefreshRequest(intent);
+            }
+        };
+        IntentFilter filter = new IntentFilter(DeadlineReceiver.ACTION_REQUEST_REFRESH);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+            } else {
+                context.registerReceiver(receiver, filter);
+            }
+            refreshReceiverRegistered = true;
+            log(Log.INFO, TAG, "refresh request receiver registered");
+        } catch (Throwable throwable) {
+            log(Log.WARN, TAG, "refresh receiver registration failed: " + throwable);
+        }
+    }
+
+    private void handleRefreshRequest(Intent intent) {
+        String expected = "";
+        try {
+            SharedPreferences prefs = getRemotePreferences(BridgeAuth.PREFS_NAME);
+            expected = prefs.getString(BridgeAuth.KEY_TOKEN, "");
+        } catch (Throwable ignored) {
+        }
+        String actual = intent.getStringExtra(BridgeAuth.EXTRA_TOKEN);
+        if (expected.isEmpty() || !expected.equals(actual)) {
+            log(Log.WARN, TAG, "rejected unauthenticated refresh request");
+            return;
+        }
+        int week = intent.getIntExtra("week", 0);
+        if (week > 0) {
+            log(Log.INFO, TAG, "timetable refresh requested for week " + week);
+            Thread worker = new Thread(() -> {
+                try {
+                    fetchTimetable(week);
+                    emitStatus("课表已更新", "moduleRequest");
+                } catch (Throwable throwable) {
+                    log(Log.WARN, TAG, "timetable refresh failed: " + throwable);
+                }
+            }, "ChaoxingDeadlineTimetableRefresh");
+            worker.setDaemon(true);
+            worker.start();
+            return;
+        }
+        log(Log.INFO, TAG, "full refresh requested by the module app");
+        requestActiveRefresh("moduleRequest", true);
+    }
+
+    private static byte[] readCapped(java.io.InputStream in, int cap) throws java.io.IOException {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        int total = 0;
+        int read;
+        while ((read = in.read(buffer)) > 0) {
+            out.write(buffer, 0, read);
+            total += read;
+            if (total > cap) {
+                break;
+            }
+        }
+        return out.toByteArray();
     }
 
     private void installActivityOverlayHook() {
@@ -616,15 +839,15 @@ public final class ChaoxingHook extends XposedModule {
             button.setAlpha(0.94f);
             button.setClickable(true);
             button.setFocusable(false);
-            button.setPadding(dp(activity, 12), dp(activity, 8), dp(activity, 12), dp(activity, 8));
-            button.setBackground(UiTheme.fillOnly(activity, UiTheme.accent(activity), dp(activity, 999)));
+            button.setPadding(UiTheme.dp(activity, 12), UiTheme.dp(activity, 8), UiTheme.dp(activity, 12), UiTheme.dp(activity, 8));
+            button.setBackground(UiTheme.fillOnly(activity, UiTheme.accent(activity), UiTheme.dp(activity, 999)));
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                button.setElevation(dp(activity, 24));
+                button.setElevation(UiTheme.dp(activity, 24));
             }
             button.setOnClickListener(v -> showHomePanel(activity));
             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2);
             params.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
-            params.setMargins(dp(activity, 12), dp(activity, 32), 0, 0);
+            params.setMargins(UiTheme.dp(activity, 12), UiTheme.dp(activity, 32), 0, 0);
             content.addView(button, params);
             log(Log.INFO, TAG, "home panel button attached");
         } catch (Throwable throwable) {
@@ -642,7 +865,7 @@ public final class ChaoxingHook extends XposedModule {
             List<OverlayTodo> todos = homePanelTodos();
             long updatedAt = overlayDataUpdatedAt();
             final AlertDialog[] holder = new AlertDialog[1];
-            View content = homePanelView(activity, todos, updatedAt,
+            View content = OverlayViews.homePanelView(activity, todos, updatedAt, homePanelScanStatus(),
                     () -> safeDismiss(holder[0]),
                     () -> switchHomePanel(holder[0], () -> showHomeSettingsPanel(activity)));
             AlertDialog dialog = new AlertDialog.Builder(activity)
@@ -675,7 +898,7 @@ public final class ChaoxingHook extends XposedModule {
         try {
             homePanelShowing = true;
             final AlertDialog[] holder = new AlertDialog[1];
-            View content = homeSettingsView(activity,
+            View content = OverlayViews.homeSettingsView(activity, overlayEnabled(), overlayWindowHours(),
                     () -> switchHomePanel(holder[0], () -> showHomePanel(activity)),
                     () -> safeDismiss(holder[0]),
                     () -> {
@@ -710,10 +933,6 @@ public final class ChaoxingHook extends XposedModule {
                 homePanelShowing = false;
             }
         }
-    }
-
-    private interface OverlayWindowAction {
-        void set(int hours);
     }
 
     private List<OverlayTodo> homePanelTodos() {
@@ -758,8 +977,8 @@ public final class ChaoxingHook extends XposedModule {
         }
         for (int i = 0; i < todos.size(); i++) {
             OverlayTodo old = todos.get(i);
-            if (isSameOverlayTodo(old, todo)) {
-                todos.set(i, betterOverlayTodo(old, todo));
+            if (OverlayViews.isSameOverlayTodo(old, todo)) {
+                todos.set(i, OverlayViews.betterOverlayTodo(old, todo));
                 return;
             }
         }
@@ -785,268 +1004,6 @@ public final class ChaoxingHook extends XposedModule {
             return CourseScanThreads.summary(courseScanPrefs());
         } catch (Throwable ignored) {
             return "线程：" + CourseScanThreads.DEFAULT + "｜暂无扫描记录";
-        }
-    }
-
-    private View homePanelView(Activity activity, List<OverlayTodo> todos, long updatedAt,
-                               Runnable closeAction, Runnable settingsAction) {
-        LinearLayout root = new LinearLayout(activity);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(activity, 20), dp(activity, 18), dp(activity, 20), dp(activity, 16));
-        root.setBackground(UiTheme.rounded(activity, UiTheme.sheet(activity), dp(activity, 22), UiTheme.stroke(activity)));
-
-        LinearLayout header = new LinearLayout(activity);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(android.view.Gravity.CENTER_VERTICAL);
-
-        LinearLayout titles = new LinearLayout(activity);
-        titles.setOrientation(LinearLayout.VERTICAL);
-        TextView title = new TextView(activity);
-        title.setText("Deadline");
-        title.setTextSize(20);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextColor(UiTheme.text(activity));
-        titles.addView(title, new LinearLayout.LayoutParams(-1, -2));
-
-        TextView subtitle = new TextView(activity);
-        String updated = updatedAt > 0L ? " · 更新于 " + DateText.deadlineTime(updatedAt) : " · 暂无刷新时间";
-        subtitle.setText("共 " + todos.size() + " 个未完成待办" + updated);
-        subtitle.setTextSize(12);
-        subtitle.setTextColor(UiTheme.muted(activity));
-        subtitle.setPadding(0, dp(activity, 3), 0, 0);
-        titles.addView(subtitle, new LinearLayout.LayoutParams(-1, -2));
-
-        TextView scanStatus = new TextView(activity);
-        scanStatus.setText(homePanelScanStatus());
-        scanStatus.setTextSize(12);
-        scanStatus.setTextColor(UiTheme.muted(activity));
-        scanStatus.setPadding(0, dp(activity, 3), 0, 0);
-        titles.addView(scanStatus, new LinearLayout.LayoutParams(-1, -2));
-        header.addView(titles, new LinearLayout.LayoutParams(0, -2, 1f));
-
-        TextView settings = smallPanelButton(activity, "设置", false);
-        settings.setOnClickListener(v -> {
-            if (settingsAction != null) {
-                settingsAction.run();
-            }
-        });
-        header.addView(settings, new LinearLayout.LayoutParams(-2, -2));
-        root.addView(header, new LinearLayout.LayoutParams(-1, -2));
-
-        LinearLayout list = new LinearLayout(activity);
-        list.setOrientation(LinearLayout.VERTICAL);
-        list.setPadding(0, dp(activity, 14), 0, 0);
-        if (todos.isEmpty()) {
-            TextView empty = new TextView(activity);
-            empty.setText("暂无未完成待办\n打开学习通后会自动刷新");
-            empty.setTextSize(14);
-            empty.setTextColor(UiTheme.muted(activity));
-            empty.setGravity(android.view.Gravity.CENTER);
-            empty.setLineSpacing(0f, 1.2f);
-            empty.setPadding(0, dp(activity, 28), 0, dp(activity, 28));
-            list.addView(empty, new LinearLayout.LayoutParams(-1, -2));
-        } else {
-            for (OverlayTodo todo : todos) {
-                list.addView(overlayRow(activity, todo));
-            }
-        }
-
-        ScrollView scroll = new ScrollView(activity);
-        scroll.setFillViewport(false);
-        scroll.addView(list, new ScrollView.LayoutParams(-1, -2));
-        int maxHeight = Math.min(dp(activity, 460), (int) (activity.getResources().getDisplayMetrics().heightPixels * 0.62f));
-        root.addView(scroll, new LinearLayout.LayoutParams(-1, maxHeight));
-
-        TextView close = smallPanelButton(activity, "关闭", true);
-        close.setOnClickListener(v -> {
-            if (closeAction != null) {
-                closeAction.run();
-            }
-        });
-        LinearLayout.LayoutParams closeParams = new LinearLayout.LayoutParams(-1, -2);
-        closeParams.setMargins(0, dp(activity, 8), 0, 0);
-        root.addView(close, closeParams);
-        return root;
-    }
-
-    private View homeSettingsView(Activity activity, Runnable backAction, Runnable closeAction,
-                                  Runnable fullSettingsAction, Runnable toggleOverlayAction,
-                                  OverlayWindowAction windowAction) {
-        LinearLayout root = new LinearLayout(activity);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(activity, 20), dp(activity, 18), dp(activity, 20), dp(activity, 16));
-        root.setBackground(UiTheme.rounded(activity, UiTheme.sheet(activity), dp(activity, 22), UiTheme.stroke(activity)));
-
-        TextView title = new TextView(activity);
-        title.setText("设置");
-        title.setTextSize(20);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextColor(UiTheme.text(activity));
-        root.addView(title, new LinearLayout.LayoutParams(-1, -2));
-
-        Space topSpace = new Space(activity);
-        root.addView(topSpace, new LinearLayout.LayoutParams(1, dp(activity, 12)));
-
-        root.addView(settingsRow(activity,
-                "学习通内弹窗",
-                "控制进入学习通首页时是否显示待办弹窗",
-                overlayEnabled() ? "已开启" : "已关闭",
-                true,
-                toggleOverlayAction));
-
-        root.addView(settingsRow(activity,
-                "强制深色模式",
-                "实验：使用学习通内置深色主题，重启学习通后生效；作业卡片、评论栏等个别组件仍为浅色（学习通自身适配不全）",
-                darkModeForceEnabled() ? "已开启" : "已关闭",
-                false,
-                () -> {
-                    setDarkModeForceFromPanel(activity, !darkModeForceEnabled());
-                    android.widget.Toast.makeText(activity, "重启学习通后生效", android.widget.Toast.LENGTH_SHORT).show();
-                }));
-
-        root.addView(settingsRow(activity,
-                "学习通深色设置页",
-                "打开学习通内置的深色设置页（旧版入口）",
-                "",
-                false,
-                () -> openDarkSettingActivity(activity)));
-
-        TextView section = new TextView(activity);
-        section.setText("弹窗范围");
-        section.setTextSize(13);
-        section.setTypeface(Typeface.DEFAULT_BOLD);
-        section.setTextColor(UiTheme.muted(activity));
-        section.setPadding(0, dp(activity, 12), 0, dp(activity, 6));
-        root.addView(section, new LinearLayout.LayoutParams(-1, -2));
-
-        int currentWindow = overlayWindowHours();
-        for (int option : OVERLAY_WINDOW_OPTIONS) {
-            String label = overlayWindowLabel(option);
-            boolean selected = option == currentWindow;
-            root.addView(settingsRow(activity,
-                    label,
-                    selected ? "当前使用" : "点击切换",
-                    selected ? "✓" : "",
-                    selected,
-                    () -> {
-                        if (windowAction != null) {
-                            windowAction.set(option);
-                        }
-                    }));
-        }
-
-        LinearLayout actions = new LinearLayout(activity);
-        actions.setOrientation(LinearLayout.HORIZONTAL);
-        actions.setPadding(0, dp(activity, 14), 0, 0);
-        TextView back = smallPanelButton(activity, "返回待办", false);
-        back.setOnClickListener(v -> {
-            if (backAction != null) {
-                backAction.run();
-            }
-        });
-        actions.addView(back, new LinearLayout.LayoutParams(0, -2, 1f));
-
-        TextView full = smallPanelButton(activity, "完整设置", false);
-        full.setOnClickListener(v -> {
-            if (fullSettingsAction != null) {
-                fullSettingsAction.run();
-            }
-        });
-        LinearLayout.LayoutParams fullParams = new LinearLayout.LayoutParams(0, -2, 1f);
-        fullParams.setMargins(dp(activity, 8), 0, 0, 0);
-        actions.addView(full, fullParams);
-        root.addView(actions, new LinearLayout.LayoutParams(-1, -2));
-
-        TextView close = smallPanelButton(activity, "关闭", true);
-        close.setOnClickListener(v -> {
-            if (closeAction != null) {
-                closeAction.run();
-            }
-        });
-        LinearLayout.LayoutParams closeParams = new LinearLayout.LayoutParams(-1, -2);
-        closeParams.setMargins(0, dp(activity, 8), 0, 0);
-        root.addView(close, closeParams);
-        return root;
-    }
-
-    private View settingsRow(Activity activity, String title, String subtitle, String value,
-                             boolean highlighted, Runnable action) {
-        LinearLayout row = new LinearLayout(activity);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(activity, 14), dp(activity, 11), dp(activity, 14), dp(activity, 11));
-        row.setClickable(true);
-        row.setBackground(UiTheme.rounded(activity,
-                highlighted ? UiTheme.card(activity) : UiTheme.sheet(activity),
-                dp(activity, 14), UiTheme.stroke(activity)));
-        if (action != null) {
-            row.setOnClickListener(v -> action.run());
-        }
-
-        LinearLayout texts = new LinearLayout(activity);
-        texts.setOrientation(LinearLayout.VERTICAL);
-        TextView titleView = new TextView(activity);
-        titleView.setText(title);
-        titleView.setTextSize(14);
-        titleView.setTypeface(Typeface.DEFAULT_BOLD);
-        titleView.setTextColor(UiTheme.text(activity));
-        texts.addView(titleView, new LinearLayout.LayoutParams(-1, -2));
-        TextView subView = new TextView(activity);
-        subView.setText(subtitle);
-        subView.setTextSize(12);
-        subView.setTextColor(UiTheme.muted(activity));
-        subView.setPadding(0, dp(activity, 3), 0, 0);
-        texts.addView(subView, new LinearLayout.LayoutParams(-1, -2));
-        row.addView(texts, new LinearLayout.LayoutParams(0, -2, 1f));
-
-        TextView valueView = new TextView(activity);
-        valueView.setText(value);
-        valueView.setTextSize(13);
-        valueView.setTypeface(Typeface.DEFAULT_BOLD);
-        valueView.setTextColor(highlighted ? UiTheme.accent(activity) : UiTheme.muted(activity));
-        valueView.setPadding(dp(activity, 10), 0, 0, 0);
-        row.addView(valueView, new LinearLayout.LayoutParams(-2, -2));
-
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.setMargins(0, 0, 0, dp(activity, 8));
-        row.setLayoutParams(params);
-        return row;
-    }
-
-    private TextView smallPanelButton(Activity activity, String text, boolean primary) {
-        TextView button = new TextView(activity);
-        button.setText(text);
-        button.setTextSize(14);
-        button.setTypeface(Typeface.DEFAULT_BOLD);
-        button.setGravity(android.view.Gravity.CENTER);
-        button.setPadding(dp(activity, 12), dp(activity, 8), dp(activity, 12), dp(activity, 8));
-        if (primary) {
-            button.setTextColor(Color.WHITE);
-            button.setBackground(UiTheme.fillOnly(activity, UiTheme.accent(activity), dp(activity, 12)));
-        } else {
-            button.setTextColor(UiTheme.accent(activity));
-            button.setBackground(UiTheme.rounded(activity, UiTheme.card(activity), dp(activity, 12), UiTheme.stroke(activity)));
-        }
-        return button;
-    }
-
-    /**
-     * Launch Chaoxing's own hidden dark-mode settings page. The activity is
-     * declared in the host manifest (exported=false) and runs in the same
-     * process, so starting it from inside the host is indistinguishable from
-     * internal navigation — no reflection, no memory patching, nothing the
-     * risk SDK can flag. The app keeps managing its own preference key.
-     */
-    private void openDarkSettingActivity(Context context) {
-        try {
-            Intent intent = new Intent();
-            intent.setComponent(new ComponentName(
-                    TARGET_PACKAGE, "com.chaoxing.study.settings.DarkSettingActivity"));
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            context.startActivity(intent);
-            log(Log.INFO, TAG, "DarkSettingActivity launched");
-        } catch (Throwable throwable) {
-            log(Log.WARN, TAG, "open dark setting failed", throwable);
         }
     }
 
@@ -1158,11 +1115,17 @@ public final class ChaoxingHook extends XposedModule {
                 log(Log.INFO, TAG, "overlay skipped: unchanged");
                 return false;
             }
+            if (now - lastOverlayAt < OVERLAY_MIN_INTERVAL_MS) {
+                log(Log.INFO, TAG, "overlay skipped: throttled "
+                        + (now - lastOverlayAt) + "ms since last popup");
+                return false;
+            }
             overlayDialogShowing = true;
             lastOverlayAt = now;
             lastOverlayFingerprint = fingerprint;
             final AlertDialog[] holder = new AlertDialog[1];
-            View content = overlayView(activity, todos, realtime, () -> safeDismiss(holder[0]));
+            View content = OverlayViews.overlayView(activity, todos, realtime, overlayWindowHours(),
+                    () -> safeDismiss(holder[0]));
             AlertDialog dialog = new AlertDialog.Builder(activity)
                     .setView(content)
                     .show();
@@ -1342,8 +1305,8 @@ public final class ChaoxingHook extends XposedModule {
         if (!safe(a.type).equals(safe(b.type))) {
             return false;
         }
-        String titleA = normalizeOverlayText(a.title);
-        String titleB = normalizeOverlayText(b.title);
+        String titleA = OverlayViews.normalizeOverlayText(a.title);
+        String titleB = OverlayViews.normalizeOverlayText(b.title);
         if (titleA.isEmpty() || !titleA.equals(titleB)) {
             return false;
         }
@@ -1359,52 +1322,37 @@ public final class ChaoxingHook extends XposedModule {
         }
     }
 
+    /** Classroom activities are opt-in for the same reason as chapter tasks. */
+    private boolean activityNotificationsEnabled() {
+        try {
+            return getRemotePreferences(AppSettings.PREFS).getBoolean("notify_activity", false);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     private void addOverlayTodo(List<OverlayTodo> todos, OverlayTodo todo, long now) {
         if (todo == null || !isInOverlayWindow(todo.dueAt, now)) {
             return;
         }
         if (!"\u4f5c\u4e1a".equals(todo.type) && !"\u8003\u8bd5".equals(todo.type)) {
-            // Chapter tasks reach the overlay only when their notifications are on;
-            // they are opt-in because they tend to be numerous.
-            if (!"\u7ae0\u8282".equals(todo.type) || !chapterNotificationsEnabled()) {
+            // Chapter tasks and classroom activities reach the overlay only when their
+            // notifications are on; both are opt-in because they tend to be numerous.
+            boolean chapterOptIn = "\u7ae0\u8282".equals(todo.type) && chapterNotificationsEnabled();
+            boolean activityOptIn = "\u8bfe\u5802\u6d3b\u52a8".equals(todo.type) && activityNotificationsEnabled();
+            if (!chapterOptIn && !activityOptIn) {
                 return;
             }
         }
         for (int i = 0; i < todos.size(); i++) {
             OverlayTodo old = todos.get(i);
-            if (!isSameOverlayTodo(old, todo)) {
+            if (!OverlayViews.isSameOverlayTodo(old, todo)) {
                 continue;
             }
-            todos.set(i, betterOverlayTodo(old, todo));
+            todos.set(i, OverlayViews.betterOverlayTodo(old, todo));
             return;
         }
         todos.add(todo);
-    }
-
-    private boolean isSameOverlayTodo(OverlayTodo a, OverlayTodo b) {
-        if (a == null || b == null) {
-            return false;
-        }
-        if (!safe(a.type).equals(safe(b.type))) {
-            return false;
-        }
-        String titleA = normalizeOverlayText(a.title);
-        String titleB = normalizeOverlayText(b.title);
-        if (titleA.isEmpty() || !titleA.equals(titleB)) {
-            return false;
-        }
-        return Math.abs(a.dueAt - b.dueAt) <= 5L * 60L * 1000L;
-    }
-
-    private OverlayTodo betterOverlayTodo(OverlayTodo a, OverlayTodo b) {
-        String courseA = safe(a.course);
-        String courseB = safe(b.course);
-        String titleA = safe(a.title);
-        String titleB = safe(b.title);
-        String course = courseA.length() >= courseB.length() ? courseA : courseB;
-        String title = titleA.length() >= titleB.length() ? titleA : titleB;
-        long dueAt = Math.min(a.dueAt, b.dueAt);
-        return new OverlayTodo(safe(a.type).isEmpty() ? b.type : a.type, title, course, dueAt);
     }
 
     private boolean isInOverlayWindow(long dueAt, long now) {
@@ -1436,168 +1384,20 @@ public final class ChaoxingHook extends XposedModule {
                 || value == OVERLAY_WINDOW_ALL_HOURS;
     }
 
-    private String overlayWindowLabel() {
-        return overlayWindowLabel(overlayWindowHours());
-    }
-
-    private String overlayWindowLabel(int hours) {
-        if (hours == OVERLAY_WINDOW_ALL_HOURS) {
-            return "所有未完成";
-        }
-        if (hours == 72) {
-            return "3天内";
-        }
-        return hours + "小时内";
-    }
-
     private String overlayFingerprint(List<OverlayTodo> todos) {
         StringBuilder builder = new StringBuilder();
         for (OverlayTodo todo : todos) {
             if (todo == null) {
                 continue;
             }
-            builder.append(overlayIdentity(todo)).append('|')
+            builder.append(OverlayViews.overlayIdentity(todo)).append('|')
                     .append(todo.dueAt / (5L * 60L * 1000L)).append('\n');
         }
         return builder.toString();
     }
 
-    private String overlayIdentity(OverlayTodo todo) {
-        if (todo == null) {
-            return "";
-        }
-        return safe(todo.type) + "|" + normalizeOverlayText(todo.title);
-    }
-
-    private String normalizeOverlayText(String value) {
-        return safe(value).replaceAll("\\s+", "").toLowerCase(Locale.ROOT);
-    }
-
     private String safe(String value) {
         return value == null ? "" : value.trim();
-    }
-
-    private View overlayView(Activity activity, List<OverlayTodo> todos, boolean realtime, Runnable closeAction) {
-        LinearLayout root = new LinearLayout(activity);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(activity, 20), dp(activity, 18), dp(activity, 20), dp(activity, 16));
-        root.setBackground(UiTheme.rounded(activity, UiTheme.sheet(activity), dp(activity, 22), UiTheme.stroke(activity)));
-
-        TextView title = new TextView(activity);
-        title.setText(overlayWindowHours() == OVERLAY_WINDOW_ALL_HOURS ? "待办提醒" : "\u4e34\u8fd1\u622a\u6b62\u5f85\u529e");
-        title.setTextSize(20);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextColor(UiTheme.text(activity));
-        root.addView(title, new LinearLayout.LayoutParams(-1, -2));
-
-        TextView count = new TextView(activity);
-        count.setText(overlayWindowLabel() + "\u5171 " + todos.size() + " \u4e2a\u5f85\u529e");
-        count.setTextSize(13);
-        count.setTextColor(UiTheme.muted(activity));
-        count.setPadding(0, dp(activity, 4), 0, dp(activity, 4));
-        root.addView(count, new LinearLayout.LayoutParams(-1, -2));
-
-        if (!realtime) {
-            TextView notice = new TextView(activity);
-            notice.setText("本次结果仅依据上次刷新得出的判断，无法判断最新待办，仅供参考");
-            notice.setTextSize(12);
-            notice.setTextColor(UiTheme.accent(activity));
-            notice.setLineSpacing(0f, 1.12f);
-            notice.setPadding(0, 0, 0, dp(activity, 14));
-            root.addView(notice, new LinearLayout.LayoutParams(-1, -2));
-        }
-
-        LinearLayout list = new LinearLayout(activity);
-        list.setOrientation(LinearLayout.VERTICAL);
-        for (OverlayTodo todo : todos) {
-            list.addView(overlayRow(activity, todo));
-        }
-
-        ScrollView scroll = new ScrollView(activity);
-        scroll.setFillViewport(false);
-        scroll.addView(list, new ScrollView.LayoutParams(-1, -2));
-        int maxHeight = Math.min(dp(activity, 380), (int) (activity.getResources().getDisplayMetrics().heightPixels * 0.52f));
-        root.addView(scroll, new LinearLayout.LayoutParams(-1, maxHeight));
-
-        TextView close = new TextView(activity);
-        close.setText("知道了");
-        close.setTextSize(15);
-        close.setTypeface(Typeface.DEFAULT_BOLD);
-        close.setGravity(android.view.Gravity.CENTER);
-        close.setTextColor(Color.WHITE);
-        close.setBackground(UiTheme.fillOnly(activity, UiTheme.accent(activity), dp(activity, 12)));
-        close.setPadding(0, dp(activity, 10), 0, dp(activity, 10));
-        close.setOnClickListener(v -> {
-            if (closeAction != null) {
-                closeAction.run();
-            }
-        });
-        LinearLayout.LayoutParams closeParams = new LinearLayout.LayoutParams(-1, -2);
-        closeParams.setMargins(0, dp(activity, 8), 0, 0);
-        root.addView(close, closeParams);
-        return root;
-    }
-
-    private View overlayRow(Activity activity, OverlayTodo todo) {
-        long delta = todo.dueAt - System.currentTimeMillis();
-        boolean urgent = delta <= 12L * 60L * 60L * 1000L;
-
-        LinearLayout row = new LinearLayout(activity);
-        row.setOrientation(LinearLayout.VERTICAL);
-        row.setPadding(dp(activity, 14), dp(activity, 12), dp(activity, 14), dp(activity, 12));
-        int rowBg = urgent ? UiTheme.dangerBg(activity) : UiTheme.card(activity);
-        int rowStroke = urgent ? overlayDangerStroke(activity) : UiTheme.stroke(activity);
-        row.setBackground(UiTheme.rounded(activity, rowBg, dp(activity, 14), rowStroke));
-
-        TextView title = new TextView(activity);
-        title.setText(todo.title == null || todo.title.isEmpty() ? "\u672a\u547d\u540d" : todo.title);
-        title.setTextSize(16);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextColor(UiTheme.text(activity));
-        title.setLineSpacing(0f, 1.08f);
-        row.addView(title, new LinearLayout.LayoutParams(-1, -2));
-
-        if (todo.course != null && !todo.course.isEmpty()) {
-            TextView course = new TextView(activity);
-            course.setText(todo.course);
-            course.setTextSize(13);
-            course.setTextColor(UiTheme.muted(activity));
-            course.setPadding(0, dp(activity, 5), 0, 0);
-            row.addView(course, new LinearLayout.LayoutParams(-1, -2));
-        }
-
-        LinearLayout meta = new LinearLayout(activity);
-        meta.setOrientation(LinearLayout.HORIZONTAL);
-        meta.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        meta.setPadding(0, dp(activity, 10), 0, 0);
-
-        TextView badge = new TextView(activity);
-        badge.setText(todo.type);
-        badge.setTextSize(12);
-        badge.setTypeface(Typeface.DEFAULT_BOLD);
-        boolean exam = "\u8003\u8bd5".equals(todo.type);
-        badge.setTextColor(exam ? UiTheme.badgeExam(activity) : UiTheme.badgeHomework(activity));
-        badge.setBackground(UiTheme.fillOnly(activity,
-                exam ? UiTheme.badgeExamBg(activity) : UiTheme.badgeHomeworkBg(activity), dp(activity, 999)));
-        badge.setPadding(dp(activity, 8), dp(activity, 3), dp(activity, 8), dp(activity, 3));
-        meta.addView(badge, new LinearLayout.LayoutParams(-2, -2));
-
-        TextView due = new TextView(activity);
-        due.setText(DateText.dueLine(todo.dueAt));
-        due.setTextSize(13);
-        due.setTypeface(Typeface.DEFAULT_BOLD);
-        due.setTextColor(urgent ? overlayDangerText(activity) : UiTheme.muted(activity));
-        due.setGravity(android.view.Gravity.END | android.view.Gravity.CENTER_VERTICAL);
-        due.setLineSpacing(0f, 1.05f);
-        LinearLayout.LayoutParams dueParams = new LinearLayout.LayoutParams(0, -2, 1f);
-        dueParams.setMargins(dp(activity, 12), 0, 0, 0);
-        meta.addView(due, dueParams);
-        row.addView(meta, new LinearLayout.LayoutParams(-1, -2));
-
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.setMargins(0, 0, 0, dp(activity, 10));
-        row.setLayoutParams(params);
-        return row;
     }
 
     private boolean isRefreshEligibleActivity(Activity activity) {
@@ -1632,32 +1432,6 @@ public final class ChaoxingHook extends XposedModule {
         }
     }
 
-    private int overlayDangerStroke(Context context) {
-        return UiTheme.dark(context) ? Color.rgb(127, 55, 55) : Color.rgb(255, 190, 200);
-    }
-
-    private int overlayDangerText(Context context) {
-        return UiTheme.dark(context) ? Color.rgb(248, 113, 113) : Color.rgb(194, 65, 72);
-    }
-
-    private int dp(Context context, int value) {
-        return (int) (value * context.getResources().getDisplayMetrics().density + 0.5f);
-    }
-
-    private static final class OverlayTodo {
-        final String type;
-        final String title;
-        final String course;
-        final long dueAt;
-
-        OverlayTodo(String type, String title, String course, long dueAt) {
-            this.type = type;
-            this.title = title;
-            this.course = course;
-            this.dueAt = dueAt;
-        }
-    }
-
     private void rememberRecentItem(DeadlineItem item) {
         if (item == null || item.id == null || item.dueAt <= System.currentTimeMillis()) {
             return;
@@ -1674,7 +1448,7 @@ public final class ChaoxingHook extends XposedModule {
             for (int i = RECENT_ITEMS.size() - 1; i >= 0; i--) {
                 DeadlineItem old = RECENT_ITEMS.get(i);
                 if (old == null || item.id.equals(old.id) || old.dueAt <= now
-                        || isSameOverlayTodo(new OverlayTodo(old.type, old.title, old.course, old.dueAt), current)) {
+                        || OverlayViews.isSameOverlayTodo(new OverlayTodo(old.type, old.title, old.course, old.dueAt), current)) {
                     RECENT_ITEMS.remove(i);
                 }
             }
@@ -1710,6 +1484,7 @@ public final class ChaoxingHook extends XposedModule {
         PARSING.set(true);
         try {
             collectAndFetchCourseTasks(text, ctx);
+            collectTimetable(text, ctx);
             List<DeadlineItem> items = DeadlineParser.parsePayload(text, ctx);
             if (items.isEmpty()) {
                 return 0;
@@ -1762,17 +1537,6 @@ public final class ChaoxingHook extends XposedModule {
         return matcher.find() ? matcher.group(1) : "";
     }
 
-    private String urlEncode(String value) {
-        if (value == null || value.isEmpty()) {
-            return "";
-        }
-        try {
-            return URLEncoder.encode(value, "UTF-8");
-        } catch (Throwable ignored) {
-            return value;
-        }
-    }
-
     private void inspectBytes(byte[] bytes, String source) {
         inspectBytes(bytes, ParseContext.simple(source));
     }
@@ -1788,6 +1552,7 @@ public final class ChaoxingHook extends XposedModule {
         if (url == null) {
             return;
         }
+        rememberCurriculumUuid(url);
         String lower = url.toLowerCase(Locale.ROOT);
         if (lower.contains("course") || lower.contains("work") || lower.contains("exam")
                 || lower.contains("mooc") || lower.contains("fanya") || lower.contains("chaoxing")
@@ -1826,9 +1591,15 @@ public final class ChaoxingHook extends XposedModule {
                 synchronized (FETCHED_URLS) {
                     FETCHED_URLS.clear();
                 }
+                synchronized (SEEN_ITEM_IDS) {
+                    SEEN_ITEM_IDS.clear();
+                }
                 fetchUrl("https://mooc1-api.chaoxing.com/work/stu-work", "active.workPage");
                 fetchUrl("https://mooc1-api.chaoxing.com/exam-ans/exam/phone/examcode", "active.examPage");
                 fetchUrl("https://mooc1-api.chaoxing.com/mycourse/backclazzdata?view=json&rss=1", "active.courseList");
+                // Timetable last: COURSE_NAMES is fresh by then, which the in-class
+                // boost needs to map a lesson onto its course.
+                fetchTimetable();
                 completed = true;
                 emitStatus("自动更新完成", reason);
             } catch (Throwable throwable) {
@@ -1848,15 +1619,29 @@ public final class ChaoxingHook extends XposedModule {
     }
 
     private int fetchUrl(String url, String source) {
-        return fetchUrl(url, ParseContext.fromSource(source, url));
+        return fetchUrl(url, ParseContext.fromSource(source, url), null);
     }
 
-    private int fetchUrl(String url, ParseContext context) {
+    int fetchUrl(String url, ParseContext context) {
+        return fetchUrl(url, context, null);
+    }
+
+    /**
+     * @param formBody when non-null the request becomes a POST carrying this form body
+     *                 (the timetable endpoint needs {@code POST week=N}; empty body =
+     *                 current week).
+     */
+    int fetchUrl(String url, ParseContext context, String formBody) {
         ParseContext ctx = context == null ? ParseContext.fromSource("", url) : context.withUrl(url);
         String source = ctx.source;
-        boolean guardedUrl = source != null && source.startsWith("active.courseList");
-        if (guardedUrl && System.currentTimeMillis() < antiSpiderUntil) {
-            log(Log.WARN, TAG, "skip active fetch while antispider cooldown is active");
+        // The verification-code cooldown must cover every active.* fetch, not just the
+        // course list: the per-course task-list / taskactivelist / exam endpoints are the
+        // ones that actually trip anti-spider, and leaving them unguarded meant the next
+        // refresh hammered them anyway. The 900ms pacing stays course-list-only.
+        boolean activeFetch = source != null && source.startsWith("active.");
+        boolean pacedUrl = source != null && source.startsWith("active.courseList");
+        if (activeFetch && System.currentTimeMillis() < antiSpiderUntil) {
+            log(Log.WARN, TAG, "skip active fetch while antispider cooldown is active, source=" + source);
             return -1;
         }
         synchronized (FETCHED_URLS) {
@@ -1870,7 +1655,7 @@ public final class ChaoxingHook extends XposedModule {
         }
         HttpURLConnection connection = null;
         try {
-            if (guardedUrl) {
+            if (pacedUrl) {
                 Thread.sleep(900L);
             }
             connection = (HttpURLConnection) new URL(url).openConnection();
@@ -1883,6 +1668,20 @@ public final class ChaoxingHook extends XposedModule {
             if (url.contains("mooc1-api.chaoxing.com/gas/clazz")) {
                 connection.setRequestProperty("Referer", "https://mooc1-api.chaoxing.com/");
                 connection.setRequestProperty("Host", "mooc1-api.chaoxing.com");
+            }
+            if (url.contains("kb.chaoxing.com")) {
+                // The PC timetable endpoint answers 403/redirect without a same-origin
+                // referer; the app process never sends one on its own.
+                connection.setRequestProperty("Referer", "https://kb.chaoxing.com/");
+            }
+            if (formBody != null) {
+                byte[] body = formBody.getBytes(StandardCharsets.UTF_8);
+                connection.setRequestMethod("POST");
+                connection.setDoOutput(true);
+                connection.setFixedLengthStreamingMode(body.length);
+                try (java.io.OutputStream out = connection.getOutputStream()) {
+                    out.write(body);
+                }
             }
             String cookie = cookieFor(url);
             if (!cookie.isEmpty()) {
@@ -1902,8 +1701,8 @@ public final class ChaoxingHook extends XposedModule {
             log(Log.INFO, TAG, "active fetched " + code + " " + source + " len=" + body.length());
             if (body.contains("invalid_verify") || body.contains("请输入验证码")) {
                 antiSpiderUntil = System.currentTimeMillis() + 30L * 60L * 1000L;
-                log(Log.WARN, TAG, "chapter fetch paused because Chaoxing requested verification");
-                emitStatus("章节接口触发验证码，已暂停一会儿", source);
+                log(Log.WARN, TAG, "active fetch paused because Chaoxing requested verification, source=" + source);
+                emitStatus("接口触发验证码，已暂停一会儿", source);
                 return -1;
             }
             return inspect(body, ctx);
@@ -1917,7 +1716,7 @@ public final class ChaoxingHook extends XposedModule {
         }
     }
 
-    private String cookieFor(String url) {
+    String cookieFor(String url) {
         try {
             CookieManager manager = CookieManager.getInstance();
             String cookie = manager.getCookie(url);
@@ -1942,237 +1741,24 @@ public final class ChaoxingHook extends XposedModule {
             String trimmed = text.trim();
             Object root = trimmed.startsWith("[") ? new JSONArray(trimmed) : new JSONObject(trimmed);
             ArrayList<CourseRef> refs = new ArrayList<>();
-            collectCourseRefs(root, refs, 0);
+            CourseRefs.collectCourseRefs(root, refs, 0);
             for (CourseRef ref : refs) {
                 logCourseFieldSummary(ref);
                 rememberCourse(ref);
             }
             log(Log.INFO, TAG, "course refs cached from " + source + ": " + refs.size());
-            fetchCourseDeadlines(refs);
+            new CourseScanner(this).fetchCourseDeadlines(refs);
         } catch (Throwable throwable) {
             log(Log.WARN, TAG, "collect course refs failed: " + throwable);
         }
     }
 
-    private void fetchCourseDeadlines(List<CourseRef> refs) throws InterruptedException {
-        List<CourseRef> plan = courseScanPlan(refs);
-        if (plan.isEmpty()) {
-            log(Log.INFO, TAG, "course deadline scan skipped: no eligible courses");
-            return;
-        }
-        long startedAt = System.currentTimeMillis();
-        String cookieUid = uidFromCookies();
-        AtomicInteger scheduled = new AtomicInteger();
-        AtomicInteger scanned = new AtomicInteger();
-        AtomicInteger foundItems = new AtomicInteger();
-        List<CourseScanResult> results = Collections.synchronizedList(new ArrayList<>());
-        int threadCount = courseFetchThreads();
-        ExecutorService executor = Executors.newFixedThreadPool(threadCount, runnable -> {
-            Thread thread = new Thread(runnable, "ChaoxingDeadlineCourseScan");
-            thread.setDaemon(true);
-            return thread;
-        });
-        try {
-            for (CourseRef ref : plan) {
-                int index = scheduled.incrementAndGet();
-                executor.execute(() -> {
-                    try {
-                        Thread.sleep((long) (index % threadCount) * 40L);
-                        int found = fetchCourseDeadline(ref, cookieUid);
-                        if (found >= 0) {
-                            results.add(new CourseScanResult(ref, found > 0));
-                            foundItems.addAndGet(found);
-                            scanned.incrementAndGet();
-                        }
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                    } catch (Throwable throwable) {
-                        log(Log.WARN, TAG, "course deadline fetch failed: " + throwable.getClass().getSimpleName());
-                    }
-                });
-            }
-        } finally {
-            executor.shutdown();
-        }
-        boolean completed = executor.awaitTermination(90L, TimeUnit.SECONDS);
-        if (!completed) {
-            executor.shutdownNow();
-            log(Log.WARN, TAG, "course deadline scan timeout: " + scanned.get() + "/" + scheduled.get()
-                    + ", score update skipped");
-        } else {
-            emitCourseScanBatch(results);
-        }
-        long elapsed = System.currentTimeMillis() - startedAt;
-        lastCourseScanThreads = threadCount;
-        lastCourseScanRefs = refs.size();
-        lastCourseScanScanned = scanned.get();
-        emitCourseScanPerformance(threadCount, elapsed, refs.size(), scheduled.get(), scanned.get());
-        log(Log.INFO, TAG, "course deadline scan complete: " + scanned.get() + "/" + scheduled.get()
-                + " courses, refs=" + refs.size() + ", items=" + foundItems.get()
-                + ", elapsed=" + elapsed + "ms, threads=" + threadCount);
-    }
-
-    private int fetchCourseDeadline(CourseRef ref, String cookieUid) {
-        String refUid = ref.uid.isEmpty() ? cookieUid : ref.uid;
-        String uid = refUid.isEmpty() ? "" : "&uid=" + urlEncode(refUid);
-        String cpi = ref.cpi.isEmpty() ? "" : "&cpi=" + urlEncode(ref.cpi);
-        int failures = 0;
-        int found = 0;
-        int result = fetchUrl("https://mooc1-api.chaoxing.com/work/task-list?courseId="
-                        + urlEncode(ref.courseId) + "&classId=" + urlEncode(ref.classId) + cpi,
-                parseContextForCourse("active.workList", ref, refUid));
-        if (result < 0) {
-            failures++;
-        } else {
-            found += result;
-        }
-        result = fetchUrl("https://mobilelearn.chaoxing.com/ppt/activeAPI/taskactivelist?courseId="
-                        + urlEncode(ref.courseId) + "&classId=" + urlEncode(ref.classId) + uid,
-                parseContextForCourse("active.taskList", ref, refUid));
-        if (result < 0) {
-            failures++;
-        } else {
-            found += result;
-        }
-        result = fetchUrl("https://mooc1-api.chaoxing.com/mooc-ans/exam/phone/task-list?courseId="
-                        + urlEncode(ref.courseId) + "&classId=" + urlEncode(ref.classId) + cpi,
-                parseContextForCourse("active.examList", ref, refUid));
-        if (result < 0) {
-            failures++;
-        } else {
-            found += result;
-        }
-        if (failures > 0 && found == 0) {
-            return -1;
-        }
-        return found;
-    }
-
-    private List<CourseRef> courseScanPlan(List<CourseRef> refs) {
-        long startedAt = System.currentTimeMillis();
-        LinkedHashMap<String, CourseRef> unique = new LinkedHashMap<>();
-        if (refs != null) {
-            for (CourseRef ref : refs) {
-                if (ref == null || ref.courseId.isEmpty() || ref.classId.isEmpty()) {
-                    continue;
-                }
-                unique.putIfAbsent(courseKey(ref), ref);
-            }
-        }
-        ArrayList<CourseRef> candidates = new ArrayList<>(unique.values());
-        SharedPreferences prefs = courseScanPrefs();
-        if (prefs == null) {
-            return candidates;
-        }
-        long now = System.currentTimeMillis();
-        ArrayList<CourseRef> result = new ArrayList<>();
-        int skipped = 0;
-        for (CourseRef ref : candidates) {
-            if (shouldScanCourse(ref, prefs, now)) {
-                result.add(ref);
-            } else {
-                skipped++;
-            }
-        }
-        result.sort(Comparator
-                .comparingInt((CourseRef ref) -> CourseScanScores.score(prefs, courseKey(ref))).reversed()
-                .thenComparingLong(ref -> CourseScanScores.lastScanAt(prefs, courseKey(ref)))
-                .thenComparing(ref -> safe(ref.courseName)));
-        long elapsed = System.currentTimeMillis() - startedAt;
-        log(Log.INFO, TAG, "course scan plan: selected=" + result.size()
-                + ", skipped=" + skipped + ", refs=" + (refs == null ? 0 : refs.size())
-                + ", elapsed=" + elapsed + "ms");
-        return result;
-    }
-
-    private boolean shouldScanCourse(CourseRef ref, SharedPreferences prefs, long now) {
-        return CourseScanScores.shouldScan(prefs, courseKey(ref), now);
-    }
-
-    private int courseFetchThreads() {
-        return CourseScanThreads.current(courseScanPrefs());
-    }
-
-    private void emitCourseScanPerformance(int threads, long elapsedMs, int refs, int scheduled, int scanned) {
-        Context context = ensureHostContext();
-        if (context == null || scheduled <= 0 || elapsedMs <= 0L) {
-            return;
-        }
-        try {
-            Intent intent = new Intent(DeadlineReceiver.ACTION_COURSE_SCAN_PERF);
-            intent.setComponent(new ComponentName(MODULE_PACKAGE, MODULE_PACKAGE + ".DeadlineReceiver"));
-            intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
-            intent.putExtra("threads", threads);
-            intent.putExtra("elapsed_ms", elapsedMs);
-            intent.putExtra("refs", refs);
-            intent.putExtra("scheduled", scheduled);
-            intent.putExtra("scanned", scanned);
-            attachBridgeToken(intent);
-            context.sendBroadcast(intent);
-        } catch (Throwable throwable) {
-            log(Log.WARN, TAG, "course scan perf emit failed: " + throwable.getClass().getSimpleName());
-        }
-    }
-
-    private void emitCourseScanBatch(List<CourseScanResult> results) {
-        Context context = ensureHostContext();
-        if (context == null || results == null || results.isEmpty()) {
-            return;
-        }
-        try {
-            ArrayList<String> courseIds = new ArrayList<>();
-            ArrayList<String> classIds = new ArrayList<>();
-            ArrayList<String> courseNames = new ArrayList<>();
-            boolean[] foundDeadlines = new boolean[results.size()];
-            int count = 0;
-            synchronized (results) {
-                for (CourseScanResult result : results) {
-                    if (result == null || result.ref == null) {
-                        continue;
-                    }
-                    courseIds.add(result.ref.courseId);
-                    classIds.add(result.ref.classId);
-                    courseNames.add(result.ref.courseName);
-                    foundDeadlines[count] = result.foundDeadline;
-                    count++;
-                }
-            }
-            if (count <= 0) {
-                return;
-            }
-            if (count != foundDeadlines.length) {
-                boolean[] compact = new boolean[count];
-                System.arraycopy(foundDeadlines, 0, compact, 0, count);
-                foundDeadlines = compact;
-            }
-            Intent intent = new Intent(DeadlineReceiver.ACTION_COURSE_SCAN_BATCH);
-            intent.setComponent(new ComponentName(MODULE_PACKAGE, MODULE_PACKAGE + ".DeadlineReceiver"));
-            intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
-            intent.putExtra("course_ids", courseIds.toArray(new String[0]));
-            intent.putExtra("class_ids", classIds.toArray(new String[0]));
-            intent.putExtra("course_names", courseNames.toArray(new String[0]));
-            intent.putExtra("found_deadlines", foundDeadlines);
-            attachBridgeToken(intent);
-            context.sendBroadcast(intent);
-            log(Log.INFO, TAG, "course scan score batch emitted: " + count + " courses");
-        } catch (Throwable throwable) {
-            log(Log.WARN, TAG, "course scan batch emit failed: " + throwable.getClass().getSimpleName());
-        }
-    }
-
-    private SharedPreferences courseScanPrefs() {
+    SharedPreferences courseScanPrefs() {
         try {
             return getRemotePreferences(COURSE_SCAN_PREFS);
         } catch (Throwable ignored) {
             return null;
         }
-    }
-
-    private String courseKey(CourseRef ref) {
-        if (ref == null) {
-            return "";
-        }
-        return safe(ref.courseId) + "|" + safe(ref.classId);
     }
 
     private void logCourseFieldSummary(CourseRef ref) {
@@ -2241,15 +1827,302 @@ public final class ChaoxingHook extends XposedModule {
         }
     }
 
-    private ParseContext parseContextForCourse(String prefix, CourseRef ref, String fallbackUid) {
-        if (ref == null) {
-            return ParseContext.simple(prefix);
+    private void emit(DeadlineItem item) {
+        rememberSeenItem(item);
+        Context context = ensureHostContext();
+        if (context == null) {
+            synchronized (PENDING) {
+                if (PENDING.size() < 100) {
+                    PENDING.add(item);
+                }
+            }
+            log(Log.WARN, TAG, "host context missing, queued deadline item");
+            return;
         }
-        String uid = ref.uid.isEmpty() ? fallbackUid : ref.uid;
-        return ParseContext.forCourse(prefix, "", ref.courseId, ref.classId, ref.cpi, uid, ref.courseName);
+        log(Log.INFO, TAG, "emit deadline item type=" + item.type);
+        try {
+            Intent intent = new Intent(DeadlineReceiver.ACTION_ITEM);
+            intent.setComponent(new ComponentName(MODULE_PACKAGE, MODULE_PACKAGE + ".DeadlineReceiver"));
+            intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+            intent.putExtra(DeadlineReceiver.EXTRA_ITEM_B64, Base64.getEncoder()
+                    .encodeToString(item.toJson().toString().getBytes(StandardCharsets.UTF_8)));
+            attachBridgeToken(intent);
+            context.sendBroadcast(intent);
+        } catch (Throwable throwable) {
+            log(Log.WARN, TAG, "broadcast item failed: " + throwable);
+        }
     }
 
-    private String uidFromCookies() {
+    /** Snapshot of the ids seen during the current round, for the revoked-item check. */
+    String[] snapshotSeenItemIds() {
+        synchronized (SEEN_ITEM_IDS) {
+            return SEEN_ITEM_IDS.toArray(new String[0]);
+        }
+    }
+
+    // -- weekly timetable (课程表) --
+
+    /**
+     * Pull the current teaching week's timetable. No {@code week} param: the endpoint
+     * then answers with the current week (plus firstWeekDate and the school's section
+     * table), which is exactly what the today/this-week surfaces need. A full-semester
+     * view would need one request per week — the module app requests those on demand
+     * (see {@link #fetchTimetable(int)}), one week at a time.
+     */
+    private void fetchTimetable() {
+        fetchTimetable(0);
+    }
+
+    /**
+     * @param week 1-based teaching week; 0 = whatever the endpoint calls current.
+     *             schedule.html carries a curriculumUuid that identifies which
+     *             timetable the user is looking at; forward it when known so
+     *             multi-timetable accounts get the right one.
+     */
+    private void fetchTimetable(int week) {
+        StringBuilder body = new StringBuilder();
+        if (!curriculumUuid.isEmpty()) {
+            body.append("curriculumUuid=").append(android.net.Uri.encode(curriculumUuid));
+        }
+        if (week > 0) {
+            if (body.length() > 0) {
+                body.append('&');
+            }
+            body.append("week=").append(week);
+        }
+        fetchUrl(TIMETABLE_URL, ParseContext.fromSource("active.timetable", TIMETABLE_URL),
+                body.toString());
+    }
+
+    /** Remembers the curriculumUuid seen on any timetable URL (schedule.html, data calls). */
+    private void rememberCurriculumUuid(String url) {
+        if (url == null) {
+            return;
+        }
+        String uuid = queryParam(url, "curriculumUuid", "curriculumuuid", "curriculum_uuid");
+        if (!uuid.isEmpty()) {
+            curriculumUuid = uuid;
+            log(Log.INFO, TAG, "timetable uuid captured: " + uuid);
+        }
+    }
+
+    /**
+     * Recognise timetable payloads on the intercept path. The active fetch above is the
+     * primary source; whatever endpoint the app's own 课表 page uses gets parsed here
+     * for free. Identical payloads are skipped — the same JSON is seen by several hooks.
+     */
+    private void collectTimetable(String text, ParseContext context) {
+        if (!TimetableParser.looksLikeTimetable(text)) {
+            logUnknownTimetableShape(text, context);
+            return;
+        }
+        String signature = Integer.toHexString(text.hashCode()) + ":" + text.length();
+        if (signature.equals(lastTimetableSignature)) {
+            return;
+        }
+        TimetableParser.Result result = TimetableParser.parse(text);
+        if (result == null || result.lessons.isEmpty()) {
+            return;
+        }
+        lastTimetableSignature = signature;
+        rememberTimetable(result);
+    }
+
+    /**
+     * A timetable endpoint answering with an unknown shape would otherwise fail
+     * silently. Log one sample per payload shape so the parser can be adapted
+     * (the log line carries the first 400 characters of the response).
+     */
+    private void logUnknownTimetableShape(String text, ParseContext context) {
+        if (text == null || text.length() > 2_000_000) {
+            return;
+        }
+        String lower = text.toLowerCase(Locale.ROOT);
+        String url = context == null ? "" : context.url;
+        String urlLower = url.toLowerCase(Locale.ROOT);
+        boolean suspicious = lower.contains("dayofweek") || lower.contains("curriculum")
+                || urlLower.contains("curriculum") || urlLower.contains("lesson")
+                || urlLower.contains("schedule");
+        if (!suspicious) {
+            return;
+        }
+        String signature = Integer.toHexString(text.hashCode()) + ":" + text.length();
+        synchronized (UNKNOWN_TIMETABLE_SIGNATURES) {
+            if (!UNKNOWN_TIMETABLE_SIGNATURES.add(signature)) {
+                return;
+            }
+            if (UNKNOWN_TIMETABLE_SIGNATURES.size() > 20) {
+                UNKNOWN_TIMETABLE_SIGNATURES.clear();
+            }
+        }
+        String sample = text.substring(0, Math.min(400, text.length())).replace('\n', ' ');
+        log(Log.WARN, TAG, "unparsed timetable-ish payload from " + url + ": " + sample);
+    }
+
+    private void rememberTimetable(TimetableParser.Result result) {
+        synchronized (LESSONS) {
+            LESSONS.clear();
+            LESSONS.addAll(result.lessons);
+        }
+        if (result.firstWeekDate > 0L) {
+            firstWeekDate = result.firstWeekDate;
+        }
+        if (result.sectionTimesJson != null && !result.sectionTimesJson.isEmpty()) {
+            sectionTimesJson = result.sectionTimesJson;
+        }
+        buildCourseKeyIndex();
+        emitTimetable(result);
+        scheduleSessionTick();
+        log(Log.INFO, TAG, "timetable stored: lessons=" + result.lessons.size()
+                + " firstWeekDate=" + firstWeekDate);
+    }
+
+    /** name -> "courseId|classId" for the in-class boost; first class of a course wins. */
+    private void buildCourseKeyIndex() {
+        synchronized (COURSE_KEYS_BY_NAME) {
+            COURSE_KEYS_BY_NAME.clear();
+            synchronized (COURSE_NAMES) {
+                for (Map.Entry<String, String> entry : COURSE_NAMES.entrySet()) {
+                    String key = entry.getKey();
+                    int bar = key.indexOf('|');
+                    if (bar <= 0 || entry.getValue() == null || entry.getValue().isEmpty()) {
+                        continue;
+                    }
+                    COURSE_KEYS_BY_NAME.putIfAbsent(entry.getValue(), key);
+                }
+            }
+        }
+    }
+
+    private void emitTimetable(TimetableParser.Result result) {
+        Context context = ensureHostContext();
+        if (context == null) {
+            return;
+        }
+        try {
+            JSONArray array = new JSONArray();
+            for (Lesson lesson : result.lessons) {
+                array.put(lesson.toJson());
+            }
+            long firstWeek = result.firstWeekDate > 0L ? result.firstWeekDate : firstWeekDate;
+            String times = result.sectionTimesJson != null && !result.sectionTimesJson.isEmpty()
+                    ? result.sectionTimesJson : sectionTimesJson;
+            Intent intent = new Intent(DeadlineReceiver.ACTION_TIMETABLE);
+            intent.setComponent(new ComponentName(MODULE_PACKAGE, MODULE_PACKAGE + ".DeadlineReceiver"));
+            intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+            intent.putExtra("lessons", array.toString());
+            intent.putExtra("first_week_date", firstWeek);
+            intent.putExtra("section_times", times == null ? "" : times);
+            attachBridgeToken(intent);
+            context.sendBroadcast(intent);
+        } catch (Throwable throwable) {
+            log(Log.WARN, TAG, "emit timetable failed: " + throwable.getClass().getSimpleName());
+        }
+    }
+
+    private List<Lesson> lessonsSnapshot() {
+        synchronized (LESSONS) {
+            return new ArrayList<>(LESSONS);
+        }
+    }
+
+    private String courseKeyForLesson(String courseName) {
+        if (courseName == null || courseName.isEmpty()) {
+            return null;
+        }
+        synchronized (COURSE_KEYS_BY_NAME) {
+            return COURSE_KEYS_BY_NAME.get(courseName.trim());
+        }
+    }
+
+    // -- in-class activity boost --
+
+    private void scheduleSessionTick() {
+        if (sessionTickScheduled) {
+            return;
+        }
+        sessionTickScheduled = true;
+        new Handler(Looper.getMainLooper()).postDelayed(this::sessionTick, SESSION_TICK_MS);
+    }
+
+    private void sessionTick() {
+        sessionTickScheduled = false;
+        try {
+            maybeBoostForClassSession();
+        } catch (Throwable throwable) {
+            log(Log.WARN, TAG, "session tick failed: " + throwable.getClass().getSimpleName());
+        } finally {
+            scheduleSessionTick();
+        }
+    }
+
+    /**
+     * While a class is in its first minutes, poll that course's classroom-activity list
+     * — sign-ins and polls open exactly there. Paced by SESSION_REFRESH_GAP_MS and only
+     * for the session's own course, so this costs one request per two minutes per class,
+     * never a full refresh.
+     */
+    private void maybeBoostForClassSession() {
+        try {
+            if (!getRemotePreferences(AppSettings.PREFS).getBoolean("class_session_boost", true)) {
+                return;
+            }
+        } catch (Throwable ignored) {
+            return;
+        }
+        List<Lesson> lessons = lessonsSnapshot();
+        if (lessons.isEmpty() || firstWeekDate <= 0L) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        Lesson current = ScheduleMath.currentLesson(lessons, now, firstWeekDate, sectionTimesJson);
+        if (current == null) {
+            return;
+        }
+        long start = ScheduleMath.lessonStartAt(firstWeekDate,
+                ScheduleMath.currentWeek(now, firstWeekDate), current.dayOfWeek,
+                current.beginSection, sectionTimesJson);
+        if (start <= 0L || now - start > SESSION_BOOST_WINDOW_MS) {
+            return;
+        }
+        if (now - lastSessionRefreshAt < SESSION_REFRESH_GAP_MS) {
+            return;
+        }
+        String courseKey = courseKeyForLesson(current.name);
+        if (courseKey == null) {
+            log(Log.INFO, TAG, "class session boost skipped, course key unknown: " + current.name);
+            return;
+        }
+        lastSessionRefreshAt = now;
+        refreshCourseActivities(courseKey, current.name);
+    }
+
+    private void refreshCourseActivities(String courseKey, String courseName) {
+        int bar = courseKey.indexOf('|');
+        if (bar <= 0) {
+            return;
+        }
+        final String courseId = courseKey.substring(0, bar);
+        final String classId = courseKey.substring(bar + 1);
+        final String uid = uidFromCookies();
+        String url = "https://mobilelearn.chaoxing.com/ppt/activeAPI/taskactivelist?courseId="
+                + Uri.encode(courseId) + "&classId=" + Uri.encode(classId)
+                + (uid.isEmpty() ? "" : "&uid=" + Uri.encode(uid));
+        Thread worker = new Thread(() -> {
+            try {
+                fetchUrl(url, ParseContext.forCourse("active.taskList", url, courseId, classId, "", uid, courseName), null);
+                emitStatus("上课期间已刷新课堂活动", "classSession:" + courseName);
+            } catch (Throwable throwable) {
+                log(Log.WARN, TAG, "class session activity refresh failed: "
+                        + throwable.getClass().getSimpleName());
+            }
+        }, "ChaoxingDeadlineSessionBoost");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    /** uid used by the activity endpoints; cookie-derived, no storage. */
+    String uidFromCookies() {
         String[] urls = {
                 "https://chaoxing.com/",
                 "https://mooc1-api.chaoxing.com/",
@@ -2291,106 +2164,14 @@ public final class ChaoxingHook extends XposedModule {
         return "";
     }
 
-    private void collectCourseRefs(Object node, List<CourseRef> out, int depth) throws Exception {
-        if (node == null || depth > 12 || out.size() > 80) {
+    private void rememberSeenItem(DeadlineItem item) {
+        if (item == null || item.id == null || item.id.isEmpty()) {
             return;
         }
-        if (node instanceof JSONObject) {
-            JSONObject object = (JSONObject) node;
-            JSONObject content = object.optJSONObject("content");
-            if (content != null) {
-                CourseRef ref = refFromContent(content);
-                if (ref != null) {
-                    out.add(ref);
-                }
+        synchronized (SEEN_ITEM_IDS) {
+            if (SEEN_ITEM_IDS.size() < SEEN_ITEM_IDS_LIMIT) {
+                SEEN_ITEM_IDS.add(item.id);
             }
-            String courseId = firstString(object, "courseid", "courseId", "courseIdStr", "courseidStr");
-            String classId = firstString(object, "classid", "classId", "clazzid", "clazzId", "clazzIdStr", "clazzidStr");
-            String uid = firstString(object, "uid", "puid", "personid", "personId");
-            String cpi = firstString(object, "cpi", "cpiId");
-            String courseName = firstString(object, "courseName", "coursename", "name", "title", "clazzName", "className");
-            if (!courseId.isEmpty() && !classId.isEmpty()) {
-                out.add(new CourseRef(courseId, classId, uid, cpi, courseName, object.toString()));
-            }
-            Iterator<String> keys = object.keys();
-            while (keys.hasNext()) {
-                Object child = object.opt(keys.next());
-                if (child instanceof JSONObject || child instanceof JSONArray) {
-                    collectCourseRefs(child, out, depth + 1);
-                }
-            }
-            return;
-        }
-        if (node instanceof JSONArray) {
-            JSONArray array = (JSONArray) node;
-            for (int i = 0; i < array.length(); i++) {
-                Object child = array.opt(i);
-                if (child instanceof JSONObject || child instanceof JSONArray) {
-                    collectCourseRefs(child, out, depth + 1);
-                }
-            }
-        }
-    }
-
-    private CourseRef refFromContent(JSONObject content) {
-        JSONObject course = content.optJSONObject("course");
-        if (course == null) {
-            return null;
-        }
-        JSONObject courseData = null;
-        JSONArray data = course.optJSONArray("data");
-        if (data != null && data.length() > 0) {
-            courseData = data.optJSONObject(0);
-        }
-        if (courseData == null) {
-            courseData = course;
-        }
-        String courseId = firstString(courseData, "id", "courseid", "courseId", "courseIdStr");
-        String classId = firstString(content, "id", "clazzid", "clazzId", "classid", "classId");
-        String uid = firstString(content, "uid", "puid", "personid", "personId");
-        String cpi = firstString(content, "cpi", "cpiId");
-        String courseName = firstString(courseData, "name", "courseName", "coursename", "title");
-        if (courseName.isEmpty()) {
-            courseName = firstString(content, "courseName", "coursename", "name", "title", "clazzName", "className");
-        }
-        if (courseId.isEmpty() || classId.isEmpty()) {
-            return null;
-        }
-        return new CourseRef(courseId, classId, uid, cpi, courseName, content.toString());
-    }
-
-    private String firstString(JSONObject object, String... keys) {
-        for (String key : keys) {
-            String value = object.optString(key, "");
-            if (!value.isEmpty() && !"null".equalsIgnoreCase(value)) {
-                return value;
-            }
-        }
-        return "";
-    }
-
-    private void emit(DeadlineItem item) {
-        Context context = ensureHostContext();
-        if (context == null) {
-            synchronized (PENDING) {
-                if (PENDING.size() < 100) {
-                    PENDING.add(item);
-                }
-            }
-            log(Log.WARN, TAG, "host context missing, queued deadline item");
-            return;
-        }
-        log(Log.INFO, TAG, "emit deadline item type=" + item.type);
-        try {
-            Intent intent = new Intent(DeadlineReceiver.ACTION_ITEM);
-            intent.setComponent(new ComponentName(MODULE_PACKAGE, MODULE_PACKAGE + ".DeadlineReceiver"));
-            intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
-            intent.putExtra(DeadlineReceiver.EXTRA_ITEM_B64, Base64.getEncoder()
-                    .encodeToString(item.toJson().toString().getBytes(StandardCharsets.UTF_8)));
-            attachBridgeToken(intent);
-            context.sendBroadcast(intent);
-        } catch (Throwable throwable) {
-            log(Log.WARN, TAG, "broadcast item failed: " + throwable);
         }
     }
 
@@ -2412,7 +2193,7 @@ public final class ChaoxingHook extends XposedModule {
         }
     }
 
-    private void attachBridgeToken(Intent intent) {
+    void attachBridgeToken(Intent intent) {
         try {
             SharedPreferences prefs = getRemotePreferences(BridgeAuth.PREFS_NAME);
             String token = prefs.getString(BridgeAuth.KEY_TOKEN, "");
@@ -2426,7 +2207,7 @@ public final class ChaoxingHook extends XposedModule {
         }
     }
 
-    private Context ensureHostContext() {
+    Context ensureHostContext() {
         Context context = hostContext;
         if (context != null) {
             return context;
@@ -2468,38 +2249,6 @@ public final class ChaoxingHook extends XposedModule {
         }
         for (DeadlineItem item : copy) {
             emit(item);
-        }
-    }
-
-    private static final class CourseScanResult {
-        final CourseRef ref;
-        final boolean foundDeadline;
-
-        CourseScanResult(CourseRef ref, boolean foundDeadline) {
-            this.ref = ref;
-            this.foundDeadline = foundDeadline;
-        }
-    }
-
-    private static final class CourseRef {
-        final String courseId;
-        final String classId;
-        final String uid;
-        final String cpi;
-        final String courseName;
-        final String raw;
-
-        CourseRef(String courseId, String classId, String uid, String cpi, String courseName) {
-            this(courseId, classId, uid, cpi, courseName, "");
-        }
-
-        CourseRef(String courseId, String classId, String uid, String cpi, String courseName, String raw) {
-            this.courseId = courseId == null ? "" : courseId;
-            this.classId = classId == null ? "" : classId;
-            this.uid = uid == null ? "" : uid;
-            this.cpi = cpi == null ? "" : cpi;
-            this.courseName = courseName == null ? "" : courseName;
-            this.raw = raw == null ? "" : raw;
         }
     }
 

@@ -54,10 +54,15 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
     private TextView countExpired;
     private TextView countBlocked;
     private LinearLayout emptyContainer;
+    private LinearLayout scheduleContainer;
     private EditText searchInput;
     private Spinner typeFilter;
     private String searchQuery = "";
     private String typeFilterValue = "";
+    /** "list" (flat) or "week" (grouped by day, next 7 days). */
+    private String viewMode = "list";
+    private TextView listTab;
+    private TextView weekTab;
 
     private final Runnable tick = new Runnable() {
         @Override public void run() { reload(false); handler.postDelayed(this, 5000L); }
@@ -138,6 +143,9 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         TextView settingsBtn = icon("⚙", 26, UiTheme.accent(this));
         settingsBtn.setOnClickListener(v -> startActivity(new Intent(this, SettingsActivity.class)));
         header.addView(settingsBtn, new LinearLayout.LayoutParams(dp(42), dp(48)));
+        TextView calendarBtn = icon("▦", 24, UiTheme.accent(this));
+        calendarBtn.setOnClickListener(v -> startActivity(new Intent(this, MonthCalendarActivity.class)));
+        header.addView(calendarBtn, new LinearLayout.LayoutParams(dp(42), dp(48)));
         root.addView(header, new LinearLayout.LayoutParams(-1, -2));
 
         // --- status card ---
@@ -149,6 +157,11 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         statusText = text("", 12, false, UiTheme.muted(this));
         status.addView(statusText, new LinearLayout.LayoutParams(-1, -2));
         root.addView(status, marTop(dp(18)));
+
+        // --- 今日课表 card: the timetable's prominent home-screen entry ---
+        scheduleContainer = new LinearLayout(this);
+        scheduleContainer.setOrientation(LinearLayout.VERTICAL);
+        root.addView(scheduleContainer, marTop(dp(16)));
 
         // --- stat chips ---
         LinearLayout stats = hbox();
@@ -180,7 +193,7 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         typeFilter = new Spinner(this);
         typeFilter.setAdapter(new ArrayAdapter<>(this,
                 android.R.layout.simple_spinner_dropdown_item,
-                new String[]{"全部", "作业", "考试", "章节"}));
+                new String[]{"全部", "作业", "考试", "章节", "课堂活动"}));
         typeFilter.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
@@ -195,6 +208,17 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         });
         filterBar.addView(typeFilter, new LinearLayout.LayoutParams(-2, -2));
         root.addView(filterBar, marTop(dp(12)));
+
+        // --- view mode tabs (列表 / 本周) ---
+        LinearLayout tabs = hbox();
+        listTab = tabButton("列表", true);
+        weekTab = tabButton("本周", false);
+        listTab.setOnClickListener(v -> setViewMode("list"));
+        weekTab.setOnClickListener(v -> setViewMode("week"));
+        tabs.addView(listTab, new LinearLayout.LayoutParams(0, -2, 1f));
+        tabs.addView(space(dp(10)));
+        tabs.addView(weekTab, new LinearLayout.LayoutParams(0, -2, 1f));
+        root.addView(tabs, marTop(dp(10)));
         searchInput.addTextChangedListener(new TextWatcher() {
             @Override
             public void beforeTextChanged(CharSequence s, int start, int count, int after) {
@@ -294,6 +318,9 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         countExpired.setText(String.valueOf(expired));
         countBlocked.setText(String.valueOf(blocked));
 
+        scheduleContainer.removeAllViews();
+        scheduleContainer.addView(scheduleCard());
+
         boolean empty = items.isEmpty();
         itemList.setVisibility(empty ? View.GONE : View.VISIBLE);
         emptyContainer.setVisibility(empty ? View.VISIBLE : View.GONE);
@@ -303,9 +330,146 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
 
     }
 
+    /**
+     * 今日课表卡片：首页最显眼的课表入口。显示周次、今天的课程与「上课中」状态，
+     * 点按进入周网格课表页，右侧刷新图标向学习通请求重新拉取。
+     */
+    private View scheduleCard() {
+        LinearLayout card = card();
+        card.setPadding(dp(16), dp(14), dp(16), dp(14));
+        card.setOnClickListener(v -> startActivity(new Intent(this, ScheduleActivity.class)));
+
+        DeadlineStore store = new DeadlineStore(this);
+        long now = System.currentTimeMillis();
+        long firstWeekDate = store.scheduleFirstWeekDate();
+        String sectionTimes = store.scheduleSectionTimes();
+        int week = ScheduleMath.currentWeek(now, firstWeekDate);
+        List<Lesson> today = ScheduleMath.todayLessons(store.allLessons(), now, firstWeekDate);
+        Lesson current = ScheduleMath.currentLesson(today, now, firstWeekDate, sectionTimes);
+
+        LinearLayout header = hbox();
+        TextView title = text("今日课表", 15, true, UiTheme.text(this));
+        header.addView(title, new LinearLayout.LayoutParams(0, -2, 1f));
+        TextView weekLabel = text(week > 0 ? "第 " + week + " 周" : "课表未获取",
+                11, false, UiTheme.muted(this));
+        header.addView(weekLabel, new LinearLayout.LayoutParams(-2, -2));
+        TextView refresh = icon("⟳", 18, UiTheme.accent(this));
+        refresh.setOnClickListener(v -> {
+            RefreshBridge.requestFull(this);
+            Toast.makeText(this, "已请求刷新课表", Toast.LENGTH_SHORT).show();
+        });
+        header.addView(refresh, new LinearLayout.LayoutParams(dp(30), -2));
+        TextView more = icon("›", 20, UiTheme.muted(this));
+        header.addView(more, new LinearLayout.LayoutParams(dp(22), -2));
+        card.addView(header, new LinearLayout.LayoutParams(-1, -2));
+
+        if (today.isEmpty()) {
+            TextView empty = text(store.scheduleUpdatedAt() > 0L
+                    ? "今天没有课" : "还没有课表数据\n打开学习通课表页面即可自动获取",
+                    12, false, UiTheme.muted(this));
+            empty.setPadding(dp(2), dp(8), dp(2), dp(2));
+            empty.setLineSpacing(0f, 1.2f);
+            card.addView(empty, new LinearLayout.LayoutParams(-1, -2));
+            return card;
+        }
+
+        int shown = Math.min(today.size(), 3);
+        for (int i = 0; i < shown; i++) {
+            card.addView(todayLessonRow(today.get(i), current, week, firstWeekDate,
+                    sectionTimes, now), new LinearLayout.LayoutParams(-1, -2));
+        }
+        if (today.size() > shown) {
+            TextView rest = text("还有 " + (today.size() - shown) + " 节课，点按查看完整课表",
+                    11, false, UiTheme.muted(this));
+            rest.setPadding(dp(2), dp(6), 0, 0);
+            card.addView(rest, new LinearLayout.LayoutParams(-1, -2));
+        }
+        return card;
+    }
+
+    private View todayLessonRow(Lesson lesson, Lesson current, int week, long firstWeekDate,
+                                String sectionTimes, long now) {
+        boolean isCurrent = current != null && current.id != null && current.id.equals(lesson.id);
+        long start = ScheduleMath.lessonStartAt(firstWeekDate, week, lesson.dayOfWeek,
+                lesson.beginSection, sectionTimes);
+        long end = ScheduleMath.lessonEndAt(firstWeekDate, week, lesson.dayOfWeek,
+                lesson.beginSection, lesson.sections, sectionTimes);
+        boolean isPast = end > 0L && now >= end;
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(6), dp(6), dp(6), dp(6));
+        if (isCurrent) {
+            row.setBackground(UiTheme.fillOnly(this, UiTheme.dangerBg(this), dp(10)));
+        }
+
+        TextView time = new TextView(this);
+        time.setText((start > 0L ? DateText.clock(start) : "--:--") + "\n"
+                + ScheduleMath.formatSections(lesson.beginSection, lesson.sections));
+        time.setTextSize(10);
+        time.setLineSpacing(0f, 1.1f);
+        time.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        time.setTextColor(isCurrent ? UiTheme.dangerText(this) : UiTheme.muted(this));
+        row.addView(time, new LinearLayout.LayoutParams(dp(56), -2));
+
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        TextView name = text(lesson.name + (isCurrent ? " · 上课中" : ""), 13, isCurrent,
+                isPast ? UiTheme.muted(this)
+                        : (isCurrent ? UiTheme.dangerText(this) : UiTheme.text(this)));
+        texts.addView(name, new LinearLayout.LayoutParams(-1, -2));
+        String label = lesson.label();
+        if (!label.isEmpty()) {
+            TextView meta = text(label, 10, false, UiTheme.muted(this));
+            meta.setPadding(0, dp(2), 0, 0);
+            texts.addView(meta, new LinearLayout.LayoutParams(-1, -2));
+        }
+        row.addView(texts, new LinearLayout.LayoutParams(0, -2, 1f));
+        return row;
+    }
+
+    private TextView tabButton(String label, boolean active) {
+        TextView tv = text(label, 14, active, active ? UiTheme.accent(this) : UiTheme.muted(this));
+        tv.setGravity(Gravity.CENTER);
+        tv.setPadding(dp(12), dp(10), dp(12), dp(10));
+        tv.setBackground(UiTheme.cardBg(this, 12));
+        return tv;
+    }
+
+    private void setViewMode(String mode) {
+        if (mode.equals(viewMode)) {
+            return;
+        }
+        viewMode = mode;
+        boolean list = "list".equals(mode);
+        listTab.setTextColor(list ? UiTheme.accent(this) : UiTheme.muted(this));
+        listTab.setTypeface(null, list
+                ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL);
+        weekTab.setTextColor(list ? UiTheme.muted(this) : UiTheme.accent(this));
+        weekTab.setTypeface(null, list
+                ? android.graphics.Typeface.NORMAL : android.graphics.Typeface.BOLD);
+        rebuildItemList();
+    }
+
     private void rebuildItemList() {
         itemList.removeAllViews();
-        // sort: pending first (earliest deadline top), then submitted/expired items.
+        if ("week".equals(viewMode)) {
+            renderWeek();
+            return;
+        }
+        List<DeadlineItem> sorted = filteredSorted();
+        for (DeadlineItem item : sorted) itemList.addView(itemRow(item), rowParams());
+        if (sorted.isEmpty() && !items.isEmpty()) {
+            TextView noMatch = text("没有匹配的待办\n试试清空搜索或切换类型", 13, false, UiTheme.muted(this));
+            noMatch.setGravity(Gravity.CENTER);
+            noMatch.setPadding(dp(8), dp(18), dp(8), dp(18));
+            itemList.addView(noMatch, new LinearLayout.LayoutParams(-1, -2));
+        }
+    }
+
+    /** Search + type filter, then the list view's pending-first ordering. */
+    private List<DeadlineItem> filteredSorted() {
         long now = System.currentTimeMillis();
         String query = searchQuery.toLowerCase(Locale.ROOT);
         List<DeadlineItem> sorted = new ArrayList<>();
@@ -324,13 +488,37 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
             if (aDone != bDone) return aDone ? 1 : -1;
             return aDone ? Long.compare(b.dueAt, a.dueAt) : Long.compare(a.dueAt, b.dueAt);
         });
-        for (DeadlineItem item : sorted) itemList.addView(itemRow(item), rowParams());
-        if (sorted.isEmpty() && !items.isEmpty()) {
-            TextView noMatch = text("没有匹配的待办\n试试清空搜索或切换类型", 13, false, UiTheme.muted(this));
-            noMatch.setGravity(Gravity.CENTER);
-            noMatch.setPadding(dp(8), dp(18), dp(8), dp(18));
-            itemList.addView(noMatch, new LinearLayout.LayoutParams(-1, -2));
+        return sorted;
+    }
+
+    /** 本周视图: upcoming deadlines bucketed by calendar day over the next 7 days. */
+    private void renderWeek() {
+        List<WeekGrouping.DayGroup> groups =
+                WeekGrouping.group(filteredSorted(), System.currentTimeMillis());
+        if (groups.isEmpty()) {
+            TextView empty = text("未来 7 天没有待办\n切换到「列表」可查看全部", 13, false, UiTheme.muted(this));
+            empty.setGravity(Gravity.CENTER);
+            empty.setPadding(dp(8), dp(18), dp(8), dp(18));
+            itemList.addView(empty, new LinearLayout.LayoutParams(-1, -2));
+            return;
         }
+        for (WeekGrouping.DayGroup group : groups) {
+            itemList.addView(weekHeader(group), rowParams());
+            for (DeadlineItem item : group.items) {
+                itemList.addView(itemRow(item), rowParams());
+            }
+        }
+    }
+
+    private View weekHeader(WeekGrouping.DayGroup group) {
+        LinearLayout header = hbox();
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding(dp(4), dp(14), dp(4), dp(6));
+        TextView label = text(group.label, 15, true, UiTheme.accent(this));
+        header.addView(label, new LinearLayout.LayoutParams(0, -2, 1f));
+        TextView count = text(group.items.size() + " 项", 12, false, UiTheme.muted(this));
+        header.addView(count, new LinearLayout.LayoutParams(-2, -2));
+        return header;
     }
 
     private static boolean matchesQuery(DeadlineItem item, String query) {
@@ -386,8 +574,12 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         tvCourse.setPadding(0, dp(4), 0, 0);
         texts.addView(tvCourse, new LinearLayout.LayoutParams(-1, -2));
 
-        int dueColor = done ? UiTheme.muted(this) : UiTheme.accent(this);
+        int dueColor = done ? UiTheme.muted(this)
+                : (item.vanishedAt > 0L ? UiTheme.warningText(this) : UiTheme.accent(this));
         String dueText = item.submitted ? "已提交 · 截止：" + DateText.deadlineTime(item.dueAt) : DateText.dueLine(item.dueAt);
+        if (item.vanishedAt > 0L) {
+            dueText = dueText + " · 可能已撤销";
+        }
         TextView tvDue = text(dueText, 12, false, dueColor);
         tvDue.setPadding(0, dp(4), 0, 0);
         texts.addView(tvDue, new LinearLayout.LayoutParams(-1, -2));
@@ -425,6 +617,9 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         if ("\u7ae0\u8282".equals(type)) {
             return "\u7ae0";
         }
+        if ("\u8bfe\u5802\u6d3b\u52a8".equals(type)) {
+            return "\u8bfe";
+        }
         return "\u00b7";
     }
 
@@ -434,6 +629,9 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         }
         if ("\u7ae0\u8282".equals(type)) {
             return UiTheme.badgeChapter(context);
+        }
+        if ("\u8bfe\u5802\u6d3b\u52a8".equals(type)) {
+            return UiTheme.badgeActivity(context);
         }
         return UiTheme.badgeHomework(context);
     }
@@ -445,6 +643,9 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         if ("\u7ae0\u8282".equals(type)) {
             return UiTheme.badgeChapterBg(context);
         }
+        if ("\u8bfe\u5802\u6d3b\u52a8".equals(type)) {
+            return UiTheme.badgeActivityBg(context);
+        }
         return UiTheme.badgeHomeworkBg(context);
     }
 
@@ -452,6 +653,19 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
     private void showItemMenu(DeadlineItem item) {
         List<String> actions = new ArrayList<>();
         List<Runnable> runners = new ArrayList<>();
+        if (item.vanishedAt > 0L) {
+            // Two authoritative scans did not re-report it; let the user judge.
+            actions.add("仍有效（恢复提醒）");
+            runners.add(() -> {
+                store.clearVanished(item.id);
+                DeadlineNotifier.rescheduleAll(this);
+                OverlayBridge.publish(this);
+                DeadlineWidgetProvider.updateAll(this);
+                reload(false);
+            });
+            actions.add("确认已撤销（删除）");
+            runners.add(() -> DeadlineNotifier.deleteItem(this, item.id));
+        }
         if (item.url != null && item.url.startsWith("http")) {
             actions.add("打开学习通页面");
             runners.add(() -> openChaoxingPage(item));
@@ -476,14 +690,63 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
                 .show();
     }
 
+    /**
+     * Open the captured page inside Chaoxing.
+     *
+     * Stored URLs are mostly API endpoints (mooc1-api.chaoxing.com/…) that the Chaoxing
+     * app itself cannot ACTION_VIEW — a bare startActivity then threw and the jump died
+     * with only a toast. Probe every strategy before committing: Chaoxing-scoped view,
+     * any-handler view, and finally the Chaoxing launcher entry.
+     */
     private void openChaoxingPage(DeadlineItem item) {
-        try {
-            Intent intent = new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(item.url));
+        String url = item.url == null ? "" : item.url.trim();
+        if (url.startsWith("http")) {
+            if (tryStartActivity(viewIntent(url, true))) {
+                return;
+            }
+            if (tryStartActivity(viewIntent(url, false))) {
+                return;
+            }
+        }
+        if (tryStartActivity(chaoxingLaunchIntent())) {
+            return;
+        }
+        Toast.makeText(this, "打开学习通失败", Toast.LENGTH_SHORT).show();
+    }
+
+    private Intent viewIntent(String url, boolean scopedToChaoxing) {
+        Intent intent = new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url));
+        if (scopedToChaoxing) {
             intent.setPackage(TARGET_PACKAGE);
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(intent);
+        }
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        return intent;
+    }
+
+    private Intent chaoxingLaunchIntent() {
+        try {
+            Intent intent = getPackageManager().getLaunchIntentForPackage(TARGET_PACKAGE);
+            if (intent != null) {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            }
+            return intent;
         } catch (Throwable throwable) {
-            Toast.makeText(this, "打开学习通失败", Toast.LENGTH_SHORT).show();
+            return null;
+        }
+    }
+
+    private boolean tryStartActivity(Intent intent) {
+        if (intent == null) {
+            return false;
+        }
+        try {
+            if (getPackageManager().resolveActivity(intent, 0) == null) {
+                return false;
+            }
+            startActivity(intent);
+            return true;
+        } catch (Throwable throwable) {
+            return false;
         }
     }
 
@@ -521,6 +784,11 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         else if (activeAt > 0L) detail.append("\n最近加载：").append(format(activeAt));
         else if (serviceReady) detail.append("\n状态说明：模块已加载，打开学习通后开始捕获");
         if (captureAt > 0L) detail.append("\n最近捕获：").append(format(captureAt));
+        // emitStatus writes failure/anti-spider notices here; they were stored but never
+        // surfaced, so "自动更新中/失败/触发验证码" was invisible outside the log.
+        if (lastStatus != null && !lastStatus.isEmpty()) {
+            detail.append("\n最近状态：").append(lastStatus);
+        }
         String title = targetRunning ? "LSPosed 已激活" : (loaded ? "LSPosed 状态：已加载" : "LSPosed 状态：未连接");
         return new Activation(title, detail.toString(), loaded);
     }

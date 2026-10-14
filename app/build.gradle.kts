@@ -19,8 +19,8 @@ android {
         applicationId = "dev.chaoxingdeadline"
         minSdk = 26
         targetSdk = 36
-        versionCode = 11
-        versionName = "1.8.1"
+        versionCode = 22
+        versionName = "1.12.0"
     }
 
     signingConfigs {
@@ -63,6 +63,12 @@ android {
         abortOnError = true
         checkReleaseBuilds = false
     }
+
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+        }
+    }
 }
 
 dependencies {
@@ -74,4 +80,6 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     // android.jar ships org.json as a throwing stub; a real one makes the JSON branch testable.
     testImplementation("org.json:json:20240303")
+    // DeadlineStore (SQLite + SharedPreferences) needs a device-like environment.
+    testImplementation("org.robolectric:robolectric:4.14.1")
 }

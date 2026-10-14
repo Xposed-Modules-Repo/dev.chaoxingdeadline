@@ -89,7 +89,49 @@ public final class DeadlineParser {
             collect(root, "", ctx, "", result, 0);
         } catch (Throwable ignored) {
         }
-        return result;
+        return isActiveChapterSource(ctx.source) ? dropChapterBranches(result) : result;
+    }
+
+    /**
+     * Keep only the leaf nodes of a chapter tree. The knowledge payload is 章 → 节: both
+     * levels carry a time window and would both become a row, so the parent 章 has to go.
+     * Leaves are found by collecting every node's parentnodeid and dropping the ids that
+     * appear as somebody's parent.
+     */
+    private static List<DeadlineItem> dropChapterBranches(List<DeadlineItem> items) {
+        java.util.HashSet<String> parents = new java.util.HashSet<>();
+        for (DeadlineItem item : items) {
+            if (item == null || item.raw == null || item.raw.isEmpty()) {
+                continue;
+            }
+            try {
+                String parent = new JSONObject(item.raw).optString("parentnodeid", "");
+                if (!parent.isEmpty() && !"null".equalsIgnoreCase(parent) && !"0".equals(parent)) {
+                    parents.add(parent);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (parents.isEmpty()) {
+            return items;
+        }
+        ArrayList<DeadlineItem> leaves = new ArrayList<>();
+        for (DeadlineItem item : items) {
+            if (item == null) {
+                continue;
+            }
+            boolean branch = false;
+            if (item.raw != null && !item.raw.isEmpty()) {
+                try {
+                    branch = parents.contains(new JSONObject(item.raw).optString("id", ""));
+                } catch (Throwable ignored) {
+                }
+            }
+            if (!branch) {
+                leaves.add(item);
+            }
+        }
+        return leaves;
     }
 
     private static boolean sourceLooksLikeDeadline(ParseContext context) {
@@ -99,8 +141,9 @@ public final class DeadlineParser {
         String scope = ((context.source == null ? "" : context.source) + " "
                 + (context.url == null ? "" : context.url)).toLowerCase(Locale.ROOT);
         return scope.contains("work") || scope.contains("homework") || scope.contains("exam")
-                || scope.contains("task-list") || scope.contains("taskactivelist")
-                || scope.contains("stu-work") || scope.contains("examcode")
+                || scope.contains("task-list") || scope.contains("tasklist") || scope.contains("taskactivelist")
+                || scope.contains(".activity")
+                || scope.contains("stu-work") || scope.contains("examcode") || scope.contains("chapter")
                 || scope.contains("作业") || scope.contains("考试") || scope.contains("任务");
     }
 
@@ -463,8 +506,24 @@ public final class DeadlineParser {
         return source != null && source.startsWith("active.chapter");
     }
 
+    /**
+     * Classroom-activity payloads (mobilelearn taskactivelist): sign-in, poll, quiz race,
+     * discussion, questionnaire… They used to be typed 作业, which duplicated the real
+     * homework rows and buried the activities in the wrong section; since 1.9.0 they get
+     * their own type. Both the active fetch ("active.taskList") and passively intercepted
+     * traffic (".activity" suffix from the URL mapping) are recognised.
+     */
+    private static boolean isActivitySource(String source) {
+        if (source == null) {
+            return false;
+        }
+        String lower = source.toLowerCase(Locale.ROOT);
+        return lower.startsWith("active.tasklist") || lower.contains("taskactivelist")
+                || lower.contains(".activity");
+    }
+
     private static boolean isActiveChapterListSource(String source) {
-        return source != null && source.startsWith("active.chapterList");
+        return source != null && source.startsWith("active.chapter");
     }
 
     private static boolean isUnfinishedChapterNode(JSONObject object, String path) {
@@ -477,7 +536,10 @@ public final class DeadlineParser {
         if (object.has("jobcount")) {
             return object.optInt("jobcount", 0) > 0;
         }
-        return false;
+        // The payload carries no counters at all (some clazz responses omit them): fall
+        // back to the node's own time window instead of dropping every chapter. The
+        // enclosing 章 nodes are removed afterwards by dropChapterBranches().
+        return true;
     }
 
     private static boolean isChapterNodeCandidate(JSONObject object, String path) {
@@ -505,8 +567,11 @@ public final class DeadlineParser {
         while (keys.hasNext()) {
             String key = keys.next();
             String lower = key.toLowerCase(Locale.ROOT);
-            if (lower.contains("time") && (lower.contains("end") || lower.contains("deadline")
-                    || lower.contains("expire") || lower.contains("limit"))) {
+            // Group-work payloads name the deadline "closeDate"/"endDate" rather than
+            // "…Time"; accept date-named keys too so those homework rows stop vanishing.
+            boolean dateish = lower.contains("time") || lower.contains("date");
+            if (dateish && (lower.contains("end") || lower.contains("deadline")
+                    || lower.contains("expire") || lower.contains("limit") || lower.contains("close"))) {
                 long value = parseTime(object.opt(key));
                 if (value > 0) {
                     return value;
@@ -628,6 +693,9 @@ public final class DeadlineParser {
         String lowerSource = source == null ? "" : source.toLowerCase(Locale.ROOT);
         if (lowerSource.contains("exam")) {
             return "考试";
+        }
+        if (isActivitySource(source)) {
+            return "课堂活动";
         }
         if (lowerSource.contains("work") || lowerSource.contains("homework") || lowerSource.contains("tasklist")) {
             return "作业";

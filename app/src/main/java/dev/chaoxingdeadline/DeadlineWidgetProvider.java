@@ -22,7 +22,7 @@ import java.util.List;
 public abstract class DeadlineWidgetProvider extends AppWidgetProvider {
     static final long URGENT_MS = 12L * 60L * 60L * 1000L;
     private static final String CHAOXING_PACKAGE = "com.chaoxing.mobile";
-    private static final int MAX_ROWS = 6;
+    private static final int MAX_ROWS = 10;
 
     // Design tokens following the miuix (HyperOS-style) color scheme.
     private static final int ACCENT_LIGHT = 0xFF3482FF;
@@ -55,6 +55,11 @@ public abstract class DeadlineWidgetProvider extends AppWidgetProvider {
         return UiTheme.dark(context) ? 0xFF4FD1C5 : 0xFF0E9F8E;
     }
 
+    /** Classroom activities use a violet accent. */
+    static int activityText(Context context) {
+        return UiTheme.dark(context) ? 0xFFA78BFA : 0xFF7C3AED;
+    }
+
     /** Badge colour for a given deadline type. */
     static int typeColor(Context context, String type) {
         if ("\u8003\u8bd5".equals(type)) {
@@ -62,6 +67,9 @@ public abstract class DeadlineWidgetProvider extends AppWidgetProvider {
         }
         if ("\u7ae0\u8282".equals(type)) {
             return chapterText(context);
+        }
+        if ("\u8bfe\u5802\u6d3b\u52a8".equals(type)) {
+            return activityText(context);
         }
         return accent(context);
     }
@@ -101,8 +109,13 @@ public abstract class DeadlineWidgetProvider extends AppWidgetProvider {
                     ? Long.MAX_VALUE
                     : now + windowHours * 60L * 60L * 1000L;
             List<DeadlineItem> items = new DeadlineStore(context).activeItems();
+            String courseFilter = AppSettings.widgetCourseFilter(context);
             for (DeadlineItem item : items) {
-                if (item == null || item.submitted || item.dueAt <= now || item.dueAt > horizon) {
+                if (item == null || item.submitted || item.dueAt <= now || item.dueAt > horizon
+                        || item.vanishedAt > 0L) {
+                    continue;
+                }
+                if (!passesCourseFilter(item, courseFilter)) {
                     continue;
                 }
                 pending.add(item);
@@ -110,6 +123,19 @@ public abstract class DeadlineWidgetProvider extends AppWidgetProvider {
         } catch (Throwable ignored) {
         }
         return pending;
+    }
+
+    /**
+     * Widget course filter. An empty filter keeps everything; a non-empty one matches the
+     * course name exactly. Items with no course name drop out of a filtered widget — they
+     * are the "which course was this?" leftovers, not something the user picked.
+     */
+    static boolean passesCourseFilter(DeadlineItem item, String filter) {
+        if (filter == null || filter.isEmpty()) {
+            return true;
+        }
+        String course = item.course == null ? "" : item.course;
+        return filter.equals(course);
     }
 
     /** Manual refresh button: asks the module process to re-render every widget. */
